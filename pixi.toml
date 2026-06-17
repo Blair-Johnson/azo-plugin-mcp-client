@@ -1,0 +1,11 @@
+[workspace]
+name = "azo-plugin-mcp-client"
+channels = ["conda-forge"]
+platforms = ["linux-64", "osx-arm64"]
+
+[dependencies]
+python = ">=3.11"
+
+[tool.agent-zoo.plugin]
+name = "azo-plugin-mcp-client"
+common = ["plugins/common/40_mcp_client.py"]
