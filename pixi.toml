@@ -9,3 +9,6 @@ python = ">=3.11"
 [tool.agent-zoo.plugin]
 name = "azo-plugin-mcp-client"
 common = ["src/mcp_client.py"]
+
+[tool.agent-zoo.plugin.config]
+files = ["mcp_servers.json"]

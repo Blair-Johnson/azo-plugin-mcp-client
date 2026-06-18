@@ -4,9 +4,10 @@ This plugin publishes already-discovered MCP tools as virtual agent-zoo tools
 and routes matching tool calls over MCP ``tools/call``. Discovery is explicit
 or background-only so unreliable MCP servers cannot stall normal harness turns.
 
-Configuration defaults to ``<plugin-root>/mcp_servers.json`` or
-``mcp_servers.yaml`` and can be overridden with ``AZO_MCP_CONFIG``. Both the
-common MCP ``mcpServers`` shape and a ``servers`` alias are accepted:
+Configuration defaults to the installed user config at
+``plugin-configs/azo-plugin-mcp-client/mcp_servers.json`` with the plugin source
+config as a development fallback, and can be overridden with ``AZO_MCP_CONFIG``.
+Both the common MCP ``mcpServers`` shape and a ``servers`` alias are accepted:
 
 {
   "mcpServers": {
@@ -43,6 +44,7 @@ from agent_utils.tool import Tool
 
 log = logging.getLogger("agent_zoo_user_plugin.mcp_client")
 
+_PLUGIN_NAME = "azo-plugin-mcp-client"
 _PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 _CONFIG_ENV = "AZO_MCP_CONFIG"
 _DEFAULT_PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2024-11-05")
@@ -167,15 +169,28 @@ def _shorten_tool_name(name: str) -> str:
     return f"{name[:keep].rstrip('_-')}_{digest}"
 
 
+
+def _agent_zoo_data_root() -> Path:
+    install_root = os.environ.get("AGENT_ZOO_INSTALL_ROOT", "").strip()
+    if install_root:
+        return Path(install_root).expanduser()
+    xdg_data = os.environ.get("XDG_DATA_HOME", "").strip()
+    base = Path(xdg_data).expanduser() if xdg_data else Path.home() / ".local" / "share"
+    return base / "agent-zoo"
+
+
+def _user_config_dir() -> Path:
+    return _agent_zoo_data_root() / "orchestrated" / "plugin-configs" / _PLUGIN_NAME
 def _default_config_path() -> Path:
     env_path = os.environ.get(_CONFIG_ENV, "").strip()
     if env_path:
         return Path(env_path).expanduser()
-    for name in ("mcp_servers.json", "mcp_servers.yaml", "mcp_servers.yml"):
-        candidate = _PLUGIN_ROOT / name
-        if candidate.exists():
-            return candidate
-    return _PLUGIN_ROOT / "mcp_servers.json"
+    for root in (_user_config_dir(), _PLUGIN_ROOT):
+        for name in ("mcp_servers.json", "mcp_servers.yaml", "mcp_servers.yml"):
+            candidate = root / name
+            if candidate.exists():
+                return candidate
+    return _user_config_dir() / "mcp_servers.json"
 
 
 def _load_config_document(path: Path) -> dict[str, Any]:

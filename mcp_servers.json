@@ -1,0 +1,19 @@
+{
+  "mcpServers": {
+    "chrome_devtools": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "chrome-devtools-mcp@latest",
+        "--isolated=true",
+        "--no-usage-statistics",
+        "--no-performance-crux",
+        "--redact-network-headers=true"
+      ],
+      "timeout_seconds": 60,
+      "env": {
+        "CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS": "1"
+      }
+    }
+  }
+}

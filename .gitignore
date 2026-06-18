@@ -3,4 +3,3 @@ __pycache__/
 .pixi/
 pixi.lock
 .DS_Store
-mcp_servers.json
