@@ -171,16 +171,15 @@ def _shorten_tool_name(name: str) -> str:
 
 
 def _agent_zoo_data_root() -> Path:
-    install_root = os.environ.get("AGENT_ZOO_INSTALL_ROOT", "").strip()
-    if install_root:
-        return Path(install_root).expanduser()
-    xdg_data = os.environ.get("XDG_DATA_HOME", "").strip()
-    base = Path(xdg_data).expanduser() if xdg_data else Path.home() / ".local" / "share"
-    return base / "agent-zoo"
+    for env_name in ("AGENT_ZOO_HOME", "AGENT_ZOO_STATE_ROOT"):
+        env_path = os.environ.get(env_name, "").strip()
+        if env_path:
+            return Path(env_path).expanduser()
+    return Path.home() / ".local" / "share" / "agent-zoo"
 
 
 def _user_config_dir() -> Path:
-    return _agent_zoo_data_root() / "orchestrated" / "plugin-configs" / _PLUGIN_NAME
+    return _agent_zoo_data_root() / "plugin-configs" / _PLUGIN_NAME
 def _default_config_path() -> Path:
     env_path = os.environ.get(_CONFIG_ENV, "").strip()
     if env_path:

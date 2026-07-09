@@ -8,4 +8,4 @@ Install with:
 azo-plugin install /path/to/azo-plugin-mcp-client
 ```
 
-Install initializes `~/.local/share/agent-zoo/orchestrated/plugin-configs/azo-plugin-mcp-client/mcp_servers.json` from the default `mcp_servers.json` if it is missing. Edit that installed config, or set `AZO_MCP_CONFIG`, to configure MCP servers. Normal uninstall keeps the config; use `azo-plugin uninstall azo-plugin-mcp-client --purge-config` for full removal.
+Install initializes `~/.local/share/agent-zoo/plugin-configs/azo-plugin-mcp-client/mcp_servers.json` from the default `mcp_servers.json` if it is missing. Edit that installed config, or set `AZO_MCP_CONFIG`, to configure MCP servers. Normal uninstall keeps the config; use `azo-plugin uninstall azo-plugin-mcp-client --purge-config` for full removal.
