@@ -26,6 +26,9 @@ Search schedules discovery for missing or dirty catalogs and waits at most one s
 
 Upgrading an old session removes its previously eager MCP schema advertisements; they do not count as explicit selections. Unrelated tools are preserved. Config changes discard stale in-flight discovery results rather than installing tools from a replaced server.
 
+## Protocol support
+
+The stdio client supports MCP `2026-07-28` with per-request metadata and `server/discover`, plus validated legacy initialization for older servers. It retains server metadata, handles cancellation and process cleanup, and checks pagination cursors. See `docs/protocol.md` for the verified compatibility rules and intentionally unsupported optional features. HTTP/auth transports are not part of this stdio upgrade.
 ## Development checks
 
 Tests use standard-library `unittest`, fake clients/servers, and the host's `agent_utils`. Run them from an Agent Zoo Pixi environment that provides the plugin runtime:
