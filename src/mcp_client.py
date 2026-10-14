@@ -993,9 +993,8 @@ class MCPClientRegistry:
             return {
                 "matches": matches[offset:offset + limit], "total": len(matches),
                 "next_offset": offset + limit if offset + limit < len(matches) else None,
-                "discovery": {name: self._discovery_status.get(name, "idle") for name in names},
+                "discovery": {name: self._discovery_status.get(name, "idle") if self._servers[name].enabled else "disabled" for name in names if name in self._servers},
                 "config_error": self._config_error,
-                "hint": "Enable exact match names with enable_mcp_tool(tool=[...]). If discovery is pending, retry search or use mcp_refresh(wait_seconds=...).",
             }
 
     def call_virtual_tool(self, virtual_name: str, arguments: dict[str, Any]) -> str:
@@ -1016,37 +1015,73 @@ class MCPClientRegistry:
             client.last_error = str(exc)
             return f"ERROR: MCP tool {mapping.server_name}/{mapping.tool_name} failed: {exc}"
 
-    def status_text(self) -> str:
+    def status_text(self, enabled: set[str] | None = None) -> str:
         self._load_config(force=False)
-        now = time.monotonic()
+        lines = []
         with self._lock:
-            status = {
-                "config_path": str(self.config_path),
-                "config_exists": self.config_path.exists(),
-                "config_error": self._config_error,
-                "servers": {},
-                "virtual_tools": sorted(self._virtual_tools),
-            }
-            servers_status: dict[str, Any] = status["servers"]
+            if self._config_error:
+                lines.append("Config error: " + _brief(self._config_error))
             for name, cfg in sorted(self._servers.items()):
                 client = self._clients.get(name)
-                thread = self._discovery_threads.get(name)
-                started = self._discovery_started_at.get(name)
-                servers_status[name] = {
-                    "enabled": cfg.enabled,
-                    "command": [cfg.command, *cfg.args],
-                    "cwd": cfg.cwd,
-                    "timeout_seconds": cfg.timeout_seconds,
-                    "tool_count": len(self._server_virtuals.get(name, set())),
-                    "client": client.status() if client is not None else None,
-                    "discovery": {
-                        "status": self._discovery_status.get(name, "idle"),
-                        "running": bool(thread is not None and thread.is_alive()),
-                        "elapsed_seconds": round(now - started, 3) if started else None,
-                    },
-                    "next_retry_seconds": max(0.0, self._next_retry_at.get(name, 0.0) - now),
-                }
-        return "MCP STATUS\n" + _json_dump(status)
+                discovery = self._discovery_status.get(name, "idle")
+                running = client is not None and client.is_running()
+                phase = "connected" if running else "not connected"
+                if discovery in {"queued", "running"}:
+                    phase = "discovering"
+                if not cfg.enabled:
+                    phase = "disabled"
+                if phase == "connected" and client.protocol_version:
+                    phase += f" (MCP {client.protocol_version})"
+                tools = self._server_virtuals.get(name)
+                catalog = "catalog not loaded" if tools is None else f"{len(tools)} {'cached ' if not running else ''}tool{'s' if len(tools) != 1 else ''}"
+                parts = [f"{name}: {phase}", catalog]
+                if enabled is not None:
+                    parts.append(f"{len((tools or set()) & enabled)} enabled")
+                if tools is not None and client is not None and client.tools_dirty:
+                    parts.append("catalog stale; search to refresh")
+                error = discovery if discovery.startswith("error:") else (client.last_error if client else None)
+                if error:
+                    parts.append(_brief(error) if str(error).startswith("error:") else "error: " + _brief(error))
+                retry = self._next_retry_at.get(name, 0.0) - time.monotonic()
+                if retry > 0:
+                    parts.append(f"retry in {int(retry) + 1}s")
+                lines.append("; ".join(parts))
+            if not self._servers:
+                lines.append("No MCP servers configured.")
+        return "\n".join(lines)
+
+
+def _brief(text: Any, limit: int = 200) -> str:
+    text = " ".join(str(text).split())
+    return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
+
+
+def _format_search_result(result: dict[str, Any], enabled: set[str]) -> str:
+    lines = [
+        f"{item['name']}{' [enabled]' if item['name'] in enabled else ''} — {_brief(item['description'])}"
+        for item in result["matches"]
+    ]
+    if not lines:
+        if result["total"]:
+            lines.append(f"No results on this page; {result['total']} matches total. Retry with offset=0.")
+        elif not result["discovery"] and not result["config_error"]:
+            lines.append("No MCP servers configured.")
+        else:
+            lines.append("No matching MCP tools in the loaded catalog.")
+    if result["next_offset"] is not None:
+        lines.append(f"More matches: use offset={result['next_offset']} with the same query and server ({result['total']} total).")
+    for server, status in result["discovery"].items():
+        if status in {"queued", "running"}:
+            lines.append(f"{server}: discovery pending; retry search shortly.")
+        elif status == "disabled":
+            lines.append(f"{server}: disabled.")
+        elif status == "backoff":
+            lines.append(f"{server}: discovery retry delayed; see mcp_status.")
+        elif status.startswith("error:"):
+            lines.append(f"{server}: discovery failed — {_brief(status[6:])}. See mcp_status.")
+    if result["config_error"]:
+        lines.append("Config error: " + _brief(result["config_error"]))
+    return "\n".join(lines)
 
 
 def _format_call_result(mapping: MCPVirtualTool, result: dict[str, Any]) -> str:
@@ -1135,7 +1170,7 @@ class MCPVirtualToolRouter(Tool):
                 "type": "function",
                 "function": {
                     "name": "mcp_status",
-                    "description": "Show configured MCP servers, discovery status, catalog names, and session-enabled endpoints. Catalog membership does not enable a tool.",
+                    "description": "Summarize MCP server availability, protocol, discovered/enabled tool counts, and actionable errors. Use search_mcp to find endpoint names.",
                     "parameters": {"type": "object", "properties": {}},
                 },
             },
@@ -1173,7 +1208,7 @@ class MCPVirtualToolRouter(Tool):
                     "query": {"type": "string", "description": "Case-insensitive words to match; empty lists the catalog."},
                     "server": {"type": ["string", "null"], "description": "Optional configured server name."},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 50, "description": "Results per page; default 20."},
-                    "offset": {"type": "integer", "minimum": 0, "description": "Page offset; default 0. Use next_offset from the previous result."},
+                    "offset": {"type": "integer", "minimum": 0, "description": "Page offset; default 0. Use the next offset shown when more matches are available."},
                 }},
             }},
         }
@@ -1216,8 +1251,7 @@ class MCPVirtualToolRouter(Tool):
             try:
                 args = tc.parsed_args or {}
                 if tc.name == "mcp_status":
-                    tc.result = self.registry.status_text()
-                    tc.result += "\nEnabled endpoints for this session: " + _compact_json(sorted(self._enabled_names(state)))
+                    tc.result = self.registry.status_text(enabled=self._enabled_names(state))
                 elif tc.name == "mcp_refresh":
                     tc.result = self.registry.refresh(
                         server=args.get("server") or None, force=True,
@@ -1225,10 +1259,7 @@ class MCPVirtualToolRouter(Tool):
                     )
                 elif tc.name == "search_mcp":
                     result = self.registry.search_tools(**args)
-                    enabled = self._enabled_names(state)
-                    for match in result["matches"]:
-                        match["enabled"] = match["name"] in enabled
-                    tc.result = _json_dump(result)
+                    tc.result = _format_search_result(result, self._enabled_names(state))
                 elif tc.name == "enable_mcp_tool":
                     tc.result = self._enable_tools(state, args.get("tool"))
                 elif tc.name not in self._enabled_names(state):

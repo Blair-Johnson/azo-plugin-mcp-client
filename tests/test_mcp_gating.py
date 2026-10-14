@@ -38,6 +38,10 @@ class GatingTests(unittest.TestCase):
             name: mcp.MCPServerConfig(name=name, command="unused") for name in ("rea", "other")
         }
         self.registry._clients = {name: Mock(tools_dirty=False) for name in self.registry._servers}
+        for client in self.registry._clients.values():
+            client.is_running.return_value = True
+            client.protocol_version = "2026-07-28"
+            client.last_error = None
         self.registry._schedule_discovery = Mock()
         self.registry._wait_for_discovery = Mock()
         self.registry._install_virtual_tools("rea", [tool("inspect"), tool("analyze", "Analyze assembly")])
@@ -54,12 +58,55 @@ class GatingTests(unittest.TestCase):
     def test_search_returns_names_not_schemas_or_enables(self):
         result = call(self.router, self.session, "search_mcp", query="REA inspect")
         self.assertFalse(result.error, result.result)
-        data = json.loads(result.result)
-        self.assertEqual([item["name"] for item in data["matches"]], ["mcp_rea_inspect"])
-        self.assertFalse(data["matches"][0]["enabled"])
+        self.assertEqual(result.result, "mcp_rea_inspect — Inspect an artifact")
         self.assertNotIn("SCHEMA_SENTINEL", result.result)
         self.assertEqual(self.session.mcp_enabled_tools, [])
         self.registry._schedule_discovery.assert_not_called()
+
+    def test_search_text_only_adds_relevant_notices(self):
+        paged = call(self.router, self.session, "search_mcp", limit=1)
+        self.assertIn("More matches: use offset=1", paged.result)
+        self.assertIn("3 total", paged.result)
+        for internal in ('"matches"', '"server"', '"tool"', '"config_error"', "null", "idle"):
+            self.assertNotIn(internal, paged.result)
+        self.registry._install_virtual_tools("rea", [tool("inspect", "Line one.\n\n" + "word " * 100)])
+        short = call(self.router, self.session, "search_mcp", server="rea")
+        self.assertEqual(len(short.result.splitlines()), 1)
+        self.assertTrue(short.result.endswith("…"))
+        self.assertLessEqual(len(short.result), len("mcp_rea_inspect — ") + 200)
+        self.registry._discovery_status["rea"] = "running"
+        pending = call(self.router, self.session, "search_mcp", query="missing", server="rea")
+        self.assertIn("No matching MCP tools", pending.result)
+        self.assertIn("rea: discovery pending; retry search shortly.", pending.result)
+        self.registry._discovery_status["rea"] = "error: timed out"
+        self.registry._config_error = "invalid config"
+        failed = call(self.router, self.session, "search_mcp", server="rea")
+        self.assertIn("rea: discovery failed — timed out. See mcp_status.", failed.result)
+        self.assertIn("Config error: invalid config", failed.result)
+        self.registry._servers.clear()
+        self.registry._config_error = None
+        self.assertEqual(call(self.router, self.session, "search_mcp").result, "No MCP servers configured.")
+
+    def test_status_is_a_server_summary_not_a_metadata_dump(self):
+        call(self.router, self.session, "enable_mcp_tool", tool=["mcp_rea_inspect"])
+        result = call(self.router, self.session, "mcp_status")
+        self.assertFalse(result.error, result.result)
+        self.assertEqual(result.result, "other: connected (MCP 2026-07-28); 1 tool; 0 enabled\nrea: connected (MCP 2026-07-28); 2 tools; 1 enabled")
+        for internal in ("mcp_rea_inspect", "command", "cwd", "pid", "stderr", "instructions", "config_path"):
+            self.assertNotIn(internal, result.result)
+        self.registry._clients["rea"].status.assert_not_called()
+
+    def test_status_retains_actionable_exception_details(self):
+        self.registry._remove_server_virtuals("rea")
+        self.registry._clients["rea"].is_running.return_value = False
+        self.registry._discovery_status["rea"] = "error: timed out"
+        self.registry._next_retry_at["rea"] = mcp.time.monotonic() + 30
+        self.registry._config_error = "invalid config"
+        result = call(self.router, self.session, "mcp_status")
+        self.assertIn("rea: not connected; catalog not loaded; 0 enabled; error: timed out; retry in", result.result)
+        self.assertIn("Config error: invalid config", result.result)
+        self.registry._servers["other"].enabled = False
+        self.assertIn("other: disabled", self.registry.status_text())
 
     def test_search_pagination_and_description_bound(self):
         self.registry._install_virtual_tools("rea", [tool(f"tool_{i:03}", "x" * 2000) for i in range(65)])
@@ -100,7 +147,7 @@ class GatingTests(unittest.TestCase):
         call(self.router, self.session, "enable_mcp_tool", tool=["mcp_rea_inspect", "mcp_rea_inspect", "mcp_rea_analyze"])
         self.assertEqual(self.session.mcp_enabled_tools, ["mcp_rea_analyze", "mcp_rea_inspect"])
         result = call(self.router, self.session, "search_mcp", query="inspect", server="rea")
-        self.assertTrue(json.loads(result.result)["matches"][0]["enabled"])
+        self.assertEqual(result.result, "mcp_rea_inspect [enabled] — Inspect an artifact")
 
     def test_unknown_batch_is_atomic(self):
         result = call(self.router, self.session, "enable_mcp_tool", tool=["mcp_rea_inspect", "typo"])

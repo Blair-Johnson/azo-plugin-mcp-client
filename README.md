@@ -18,7 +18,7 @@ enable_mcp_tool(tool=["mcp_rea_inspect_binary"])
 # Then call the exact endpoint using its newly exposed schema.
 ```
 
-The endpoint name above is illustrative: use exact names returned by `search_mcp`. A fresh session exposes only `search_mcp`, `enable_mcp_tool`, `mcp_status`, and `mcp_refresh` from this plugin. Search matches case-insensitive words across server names, endpoint names, and descriptions; it returns short descriptions, not input schemas. Empty `query` lists the catalog. Results default to 20 per page, with `limit` capped at 50 and `next_offset` for pagination.
+The endpoint name above is illustrative: use exact names returned by `search_mcp`. A fresh session exposes only `search_mcp`, `enable_mcp_tool`, `mcp_status`, and `mcp_refresh` from this plugin. Search matches case-insensitive words across server names, endpoint names, and descriptions; it returns short descriptions, not input schemas. Empty `query` lists the catalog. Results default to 20 per page, with `limit` capped at 50 and a next-page offset shown only when more matches remain. Search output is one callable name and concise description per line; already enabled endpoints are marked. Status summarizes each server's availability, protocol, catalog count, and enabled count, adding discovery/error/backoff details only when relevant. The enablement acknowledgment remains a small structured object.
 
 Search schedules discovery for missing or dirty catalogs and waits at most one second. A slow server may still be pending; retry search or call `mcp_refresh(server="rea", wait_seconds=10)`. Refresh does not enable anything and still returns immediately by default. Normal schema publication does not start servers or perform MCP requests.
 

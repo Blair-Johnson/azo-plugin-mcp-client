@@ -35,8 +35,7 @@ class IntegrationTests(unittest.TestCase):
                     self.assertEqual(len(session.tool_schemas), 4)
                     found = call(router, session, "search_mcp", query="first")
                     self.assertFalse(found.error, found.result)
-                    matches = json.loads(found.result)["matches"]
-                    self.assertEqual([item["name"] for item in matches], ["mcp_fake_first"])
+                    self.assertEqual(found.result, "mcp_fake_first — MCP tool first from server fake")
                     self.assertEqual(len(session.tool_schemas), 4)
                     self.assertTrue(call(router, session, "mcp_fake_first").error)
                     enabled = call(router, session, "enable_mcp_tool", tool=["mcp_fake_first"])
