@@ -1,6 +1,6 @@
 # azo-plugin-mcp-client
 
-Userspace Agent Zoo plugin for configured stdio MCP servers. Discovery fills a local catalog; endpoint schemas remain hidden until explicitly enabled for the current session. No native provider tool-search feature is required.
+Userspace Agent Zoo plugin for configured stdio or Streamable HTTP MCP servers. Discovery fills a local catalog; endpoint schemas remain hidden until explicitly enabled for the current session. No native provider tool-search feature is required.
 
 ## Install and configure
 
@@ -9,6 +9,20 @@ azo-plugin install /path/to/azo-plugin-mcp-client
 ```
 
 Installation initializes `<state-home>/plugin-configs/azo-plugin-mcp-client/mcp_servers.json` only if missing. The default state home is `~/.local/share/agent-zoo`; `AGENT_ZOO_HOME` and then `AGENT_ZOO_STATE_ROOT` override it. `AGENT_ZOO_INSTALL_ROOT` is not a state/config root. Set `AZO_MCP_CONFIG` to select a specific config file. Both `mcpServers` and `servers` config keys are supported. Normal uninstall preserves config; `--purge-config` removes it. Run `/reload` after installation to rebuild the plugin pipeline.
+
+Remote Streamable HTTP servers use `type: "http"`, a complete `url`, and optional HTTP `headers`. Header values support environment-variable expansion; TLS verification is enabled by default and private roots can be supplied with `ca_file`. `verify_ssl: false` is an explicit insecure escape hatch for controlled environments; keep credentials out of committed config files.
+
+```json
+{
+  "mcpServers": {
+    "fetch": {
+      "type": "http",
+      "url": "https://example.test/mcp",
+      "headers": {"Authorization": "Bearer $MCP_TOKEN"}
+    }
+  }
+}
+```
 
 ## Search, enable, call
 
@@ -28,7 +42,7 @@ Upgrading an old session removes its previously eager MCP schema advertisements;
 
 ## Protocol support
 
-The stdio client supports MCP `2026-07-28` with per-request metadata and `server/discover`, plus validated legacy initialization for older servers. It retains server metadata, handles cancellation and process cleanup, and checks pagination cursors. See `docs/protocol.md` for the verified compatibility rules and intentionally unsupported optional features. HTTP/auth transports are not part of this stdio upgrade.
+The stdio client supports MCP `2026-07-28` with per-request metadata and `server/discover`, plus validated legacy initialization for older servers. Streamable HTTP uses the same protocol negotiation and tool catalog, with JSON or Server-Sent Event responses, configured headers, session IDs, and protocol-version headers. Legacy SSE transport is not implemented. See `docs/protocol.md` for the verified compatibility rules and intentionally unsupported optional features.
 ## Development checks
 
 Tests use standard-library `unittest`, fake clients/servers, and the host's `agent_utils`. Run them from an Agent Zoo Pixi environment that provides the plugin runtime:

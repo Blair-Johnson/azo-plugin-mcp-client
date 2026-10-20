@@ -59,6 +59,8 @@ _UNSUPPORTED_PROTOCOL_VERSION = -32022
 _MODERN_ERROR_CODES = frozenset({-32020, -32021, _UNSUPPORTED_PROTOCOL_VERSION})
 _DEFAULT_TIMEOUT_SECONDS = 15.0
 _MAX_SERVER_TIMEOUT_SECONDS = 600.0
+_HTTP_TRANSPORT_NAMES = frozenset({"http", "streamable-http", "streamable_http"})
+_STDIO_TRANSPORT_NAMES = frozenset({"stdio", ""})
 _CONFIG_POLL_SECONDS = 2.0
 _DISCOVERY_RETRY_SECONDS = 60.0
 _DEFAULT_REFRESH_WAIT_SECONDS = 0.0
@@ -85,25 +87,35 @@ class MCPRPCError(MCPError):
 
 
 class MCPServerConfig:
-    """Normalized configuration for one stdio MCP server."""
+    """Normalized configuration for a stdio or Streamable HTTP MCP server."""
 
     def __init__(
         self,
         *,
         name: str,
-        command: str,
+        transport: str = "stdio",
+        command: str | None = None,
         args: tuple[str, ...] = (),
         env: dict[str, str] | None = None,
         cwd: str | None = None,
+        url: str | None = None,
+        headers: dict[str, str] | None = None,
+        verify_ssl: bool = True,
+        ca_file: str | None = None,
         enabled: bool = True,
         timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
         tool_prefix: str | None = None,
     ):
         self.name = name
+        self.transport = transport
         self.command = command
         self.args = tuple(args)
         self.env = dict(env or {})
         self.cwd = cwd
+        self.url = url
+        self.headers = dict(headers or {})
+        self.verify_ssl = bool(verify_ssl)
+        self.ca_file = ca_file
         self.enabled = bool(enabled)
         self.timeout_seconds = float(timeout_seconds)
         self.tool_prefix = tool_prefix
@@ -116,10 +128,15 @@ class MCPServerConfig:
     def as_tuple(self):
         return (
             self.name,
+            self.transport,
             self.command,
             self.args,
             tuple(sorted(self.env.items())),
             self.cwd,
+            self.url,
+            tuple(sorted(self.headers.items())),
+            self.verify_ssl,
+            self.ca_file,
             self.enabled,
             self.timeout_seconds,
             self.tool_prefix,
@@ -246,6 +263,35 @@ def _expand_env_map(raw: Any) -> dict[str, str]:
     return env
 
 
+def _expand_header_map(raw: Any) -> dict[str, str]:
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise MCPError("server headers must be an object")
+    headers: dict[str, str] = {}
+    for raw_name, raw_value in raw.items():
+        name = str(raw_name).strip()
+        if not name or "\r" in name or "\n" in name:
+            raise MCPError("server header names must be non-empty and cannot contain newlines")
+        if raw_value is None:
+            continue
+        value = os.path.expandvars(str(raw_value))
+        if "\r" in value or "\n" in value:
+            raise MCPError(f"server header {name!r} cannot contain newlines")
+        headers[name] = value
+    return headers
+
+
+def _normalize_http_url(raw_url: Any) -> str:
+    from urllib.parse import urlparse
+
+    url = os.path.expandvars(str(raw_url or "").strip())
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise MCPError("HTTP MCP server url must be an absolute http(s) URL")
+    return url
+
+
 def _normalize_command(raw_command: Any, raw_args: Any) -> tuple[str, tuple[str, ...]]:
     if isinstance(raw_command, (list, tuple)):
         parts = [str(part) for part in raw_command if str(part)]
@@ -283,17 +329,51 @@ def _normalize_config(raw: dict[str, Any]) -> dict[str, MCPServerConfig]:
             log.warning("Ignoring MCP server %s because its config is not an object", raw_name)
             continue
         try:
-            command, args = _normalize_command(raw_entry.get("command"), raw_entry.get("args"))
+            raw_transport = raw_entry.get("type", raw_entry.get("transport", ""))
+            transport_name = str(raw_transport or "").strip().lower()
+            if not transport_name and raw_entry.get("url") is not None and raw_entry.get("command") is None:
+                transport_name = "http"
+            if transport_name in _HTTP_TRANSPORT_NAMES:
+                transport = "http"
+                command = None
+                args = ()
+                url = _normalize_http_url(raw_entry.get("url"))
+                headers = _expand_header_map(raw_entry.get("headers"))
+                verify_ssl = raw_entry.get("verify_ssl", raw_entry.get("tls_verify", True))
+                if type(verify_ssl) is not bool:
+                    raise MCPError("HTTP verify_ssl must be a boolean")
+                raw_ca_file = raw_entry.get("ca_file", raw_entry.get("tls_ca_file"))
+                ca_file = None
+                if raw_ca_file not in (None, ""):
+                    ca_file = str(Path(os.path.expandvars(str(raw_ca_file))).expanduser())
+                if not verify_ssl and ca_file:
+                    raise MCPError("HTTP ca_file cannot be combined with verify_ssl=false")
+            elif transport_name in _STDIO_TRANSPORT_NAMES:
+                transport = "stdio"
+                command, args = _normalize_command(raw_entry.get("command"), raw_entry.get("args"))
+                url = None
+                headers = {}
+                verify_ssl = True
+                ca_file = None
+            elif transport_name == "sse":
+                raise MCPError("legacy SSE MCP transport is not supported; use Streamable HTTP (type=\"http\")")
+            else:
+                raise MCPError(f"unsupported MCP transport {raw_transport!r}")
             cwd = raw_entry.get("cwd")
             if cwd is not None:
                 cwd = str(Path(str(cwd)).expanduser())
             timeout = float(raw_entry.get("timeout_seconds", raw_entry.get("timeout", _DEFAULT_TIMEOUT_SECONDS)))
             servers[name] = MCPServerConfig(
                 name=name,
+                transport=transport,
                 command=command,
                 args=args,
                 env=_expand_env_map(raw_entry.get("env")),
                 cwd=cwd,
+                url=url,
+                headers=headers,
+                verify_ssl=verify_ssl,
+                ca_file=ca_file,
                 enabled=raw_entry.get("enabled", True) is not False,
                 timeout_seconds=min(_MAX_SERVER_TIMEOUT_SECONDS, max(1.0, timeout)),
                 tool_prefix=str(raw_entry.get("tool_prefix") or raw_entry.get("prefix") or "").strip() or None,
@@ -706,8 +786,316 @@ class StdioMCPClient:
             "stderr_tail": self.stderr_tail(),
         }
 
+class StreamableHTTPMCPClient(StdioMCPClient):
+    """MCP client for the Streamable HTTP transport.
+
+    The protocol, version negotiation, pagination, and result validation are
+    inherited from the stdio client.  Only the wire/lifecycle operations are
+    transport-specific here, which keeps the existing stdio behavior intact.
+    """
+
+    def __init__(self, config: MCPServerConfig):
+        if config.transport != "http":
+            raise MCPError(f"HTTP client received {config.transport!r} configuration")
+        super().__init__(config)
+        self._session_id: str | None = None
+        self._http_lock = threading.RLock()
+
+    def is_running(self) -> bool:
+        return self._initialized
+
+    def start(self) -> None:
+        with self._lifecycle_lock:
+            if self._initialized:
+                return
+            self.close()
+            try:
+                self._initialize()
+            except Exception as exc:
+                self.last_error = str(exc)
+                self.close()
+                raise
+
+    def close(self) -> None:
+        with self._lifecycle_lock:
+            self._initialized = False
+            self._modern_confirmed = False
+            self.protocol_version = None
+            self.protocol_era = None
+            self.server_info = {}
+            self.server_capabilities = {}
+            self.server_instructions = None
+            self.supported_versions = []
+            self.discovery_result = None
+            self.tools_dirty = True
+            self._session_id = None
+            with self._condition:
+                self._responses.clear()
+                self._pending.clear()
+                self._condition.notify_all()
+
+    def _request_headers(self, method: str | None = None) -> dict[str, str]:
+        reserved = {"accept", "content-type", "mcp-method", "mcp-protocol-version", "mcp-session-id"}
+        headers = {
+            name: value for name, value in self.config.headers.items()
+            if name.casefold() not in reserved
+        }
+        headers["Accept"] = "application/json, text/event-stream"
+        headers["Content-Type"] = "application/json"
+        if method:
+            headers["Mcp-Method"] = method
+        if self.protocol_version:
+            headers["MCP-Protocol-Version"] = self.protocol_version
+        if self._session_id:
+            headers["Mcp-Session-Id"] = self._session_id
+        return headers
+
+    @staticmethod
+    def _sse_message(data_lines: list[str]) -> dict[str, Any] | None:
+        if not data_lines:
+            return None
+        try:
+            message = json.loads("\n".join(data_lines))
+        except (TypeError, ValueError) as exc:
+            raise MCPError("MCP HTTP server returned invalid SSE JSON") from exc
+        if not isinstance(message, dict):
+            raise MCPError("MCP HTTP server returned a non-object SSE message")
+        return message
+
+    def _accept_sse_message(self, message: dict[str, Any], expected_id: int | None) -> dict[str, Any] | None:
+        method = message.get("method")
+        if method == "notifications/tools/list_changed" and "id" not in message:
+            self.tools_dirty = True
+        if expected_id is None:
+            return None
+        response_id = message.get("id")
+        if type(response_id) is int and response_id == expected_id:
+            return message
+        return None
+
+    def _read_sse_response(
+        self,
+        response,
+        *,
+        expected_id: int | None,
+        timeout: float,
+    ) -> dict[str, Any] | None:
+        import socket
+
+        data_lines: list[str] = []
+        deadline = time.monotonic() + timeout
+        while True:
+            if time.monotonic() >= deadline:
+                raise MCPTimeoutError(f"timed out waiting for MCP HTTP response from {self.config.name}")
+            try:
+                line = response.readline()
+            except (TimeoutError, socket.timeout) as exc:
+                raise MCPTimeoutError(f"timed out reading MCP HTTP response from {self.config.name}") from exc
+            if not line:
+                if data_lines:
+                    message = self._sse_message(data_lines)
+                    if message is not None:
+                        matched = self._accept_sse_message(message, expected_id)
+                        if matched is not None:
+                            return matched
+                break
+            if isinstance(line, bytes):
+                line = line.decode("utf-8", errors="replace")
+            line = line.rstrip("\r\n")
+            if not line:
+                message = self._sse_message(data_lines)
+                data_lines = []
+                if message is not None:
+                    matched = self._accept_sse_message(message, expected_id)
+                    if matched is not None:
+                        return matched
+                continue
+            if line.startswith(":"):
+                continue
+            if line.startswith("data:"):
+                value = line[5:]
+                data_lines.append(value[1:] if value.startswith(" ") else value)
+        if expected_id is None:
+            return None
+        raise MCPError(f"MCP HTTP response ended without response id {expected_id}")
+
+    def _read_http_response(
+        self,
+        response,
+        *,
+        expected_id: int | None,
+        timeout: float,
+    ) -> dict[str, Any] | None:
+        import socket
+
+        status = int(getattr(response, "status", None) or response.getcode() or 0)
+        headers = getattr(response, "headers", None)
+        if headers is not None:
+            session_id = headers.get("Mcp-Session-Id")
+            if session_id:
+                self._session_id = str(session_id)
+            content_type = str(headers.get("Content-Type", "")).split(";", 1)[0].strip().lower()
+        else:
+            content_type = ""
+        if status == 202:
+            response.read()
+            if expected_id is not None:
+                raise MCPError(f"MCP HTTP server accepted request {expected_id} without a response")
+            return None
+        if content_type == "text/event-stream":
+            return self._read_sse_response(response, expected_id=expected_id, timeout=timeout)
+        try:
+            body = response.read()
+        except (TimeoutError, socket.timeout) as exc:
+            raise MCPTimeoutError(f"timed out reading MCP HTTP response from {self.config.name}") from exc
+        if not body:
+            if status >= 400:
+                raise MCPError(f"MCP HTTP server returned HTTP {status} without a response body")
+            return None
+        try:
+            message = json.loads(body.decode("utf-8") if isinstance(body, bytes) else body)
+        except (TypeError, ValueError) as exc:
+            raise MCPError(f"MCP HTTP server returned invalid JSON (HTTP {status})") from exc
+        if not isinstance(message, dict):
+            raise MCPError("MCP HTTP server returned a non-object JSON response")
+        return message
+
+    def _post(
+        self,
+        message: dict[str, Any],
+        *,
+        expected_id: int | None,
+        timeout: float,
+    ) -> dict[str, Any] | None:
+        import socket
+        import ssl
+        from urllib import error as urllib_error
+        from urllib import request as urllib_request
+
+        if not self.config.url:
+            raise MCPError(f"MCP HTTP server {self.config.name} has no URL")
+        if timeout <= 0:
+            raise MCPTimeoutError(f"timed out before requesting MCP HTTP server {self.config.name}")
+        ssl_context = None
+        try:
+            if self.config.ca_file:
+                ssl_context = ssl.create_default_context(cafile=self.config.ca_file)
+            elif not self.config.verify_ssl:
+                ssl_context = ssl._create_unverified_context()
+        except (OSError, ssl.SSLError, ValueError) as exc:
+            raise MCPError(f"invalid TLS configuration for MCP HTTP server {self.config.name}: {exc}") from exc
+        request = urllib_request.Request(
+            self.config.url,
+            data=_compact_json(message).encode("utf-8"),
+            headers=self._request_headers(message.get("method")),
+            method="POST",
+        )
+        with self._http_lock:
+            response = None
+            try:
+                if ssl_context is None:
+                    response = urllib_request.urlopen(request, timeout=max(0.1, timeout))
+                else:
+                    response = urllib_request.urlopen(
+                        request, timeout=max(0.1, timeout), context=ssl_context
+                    )
+            except urllib_error.HTTPError as exc:
+                response = exc
+            except urllib_error.URLError as exc:
+                reason = exc.reason
+                if isinstance(reason, (TimeoutError, socket.timeout)):
+                    raise MCPTimeoutError(f"timed out contacting MCP HTTP server {self.config.name}") from exc
+                raise MCPError(f"MCP HTTP request failed for {self.config.name}: {reason}") from exc
+            except (TimeoutError, socket.timeout) as exc:
+                raise MCPTimeoutError(f"timed out contacting MCP HTTP server {self.config.name}") from exc
+            try:
+                return self._read_http_response(response, expected_id=expected_id, timeout=timeout)
+            finally:
+                if response is not None:
+                    response.close()
+
+    def _request_once(self, method: str, params: dict[str, Any] | None, timeout: float) -> dict[str, Any]:
+        with self._condition:
+            request_id = self._next_id
+            self._next_id += 1
+        message: dict[str, Any] = {"jsonrpc": "2.0", "id": request_id, "method": method}
+        if self.protocol_era == "modern":
+            request_params = dict(params or {})
+            meta = dict(request_params.get("_meta") or {})
+            meta.update({
+                _PROTOCOL_VERSION_META: self.protocol_version,
+                _CLIENT_INFO_META: dict(_CLIENT_INFO),
+                _CLIENT_CAPABILITIES_META: {},
+            })
+            request_params["_meta"] = meta
+            message["params"] = request_params
+        elif params is not None:
+            message["params"] = params
+        try:
+            response = self._post(message, expected_id=request_id, timeout=timeout)
+        except MCPTimeoutError:
+            if method != "initialize":
+                try:
+                    self._notify(
+                        "notifications/cancelled",
+                        {"requestId": request_id, "reason": "Request timed out"},
+                    )
+                except MCPError:
+                    pass
+            raise
+        if response is None:
+            raise MCPError(f"MCP HTTP server returned no response to {method}")
+        if response.get("jsonrpc") != "2.0" or ("result" in response) == ("error" in response):
+            raise MCPError(f"Malformed JSON-RPC response to {method} on {self.config.name}")
+        response_id = response.get("id")
+        if type(response_id) is not int or response_id != request_id:
+            raise MCPError(f"MCP HTTP server returned mismatched response id for {method}")
+        if "error" in response:
+            error = response["error"]
+            if not isinstance(error, dict) or type(error.get("code")) is not int or not isinstance(error.get("message"), str):
+                raise MCPError(f"Malformed JSON-RPC error from {self.config.name}")
+            raise MCPRPCError(method, self.config.name, error["code"], error["message"], error.get("data"))
+        result = response.get("result")
+        if not isinstance(result, dict):
+            raise MCPError(f"{method} on {self.config.name} returned a non-object result")
+        if self.protocol_era == "modern":
+            result_type = result.get("resultType", "complete")
+            if result_type != "complete":
+                raise MCPError(f"{method} returned unsupported resultType {result_type!r}; no optional client capabilities are enabled")
+            meta = result.get("_meta", {})
+            if not isinstance(meta, dict):
+                raise MCPError(f"{method} returned malformed result metadata")
+            info = meta.get(_SERVER_INFO_META)
+            if info is not None:
+                self.server_info = self._validate_server_info(info)
+        return result
+
+    def _notify(self, method: str, params: dict[str, Any] | None = None) -> None:
+        message: dict[str, Any] = {"jsonrpc": "2.0", "method": method}
+        if params is not None:
+            message["params"] = params
+        self._post(message, expected_id=None, timeout=self.config.timeout_seconds)
+
+    def status(self) -> dict[str, Any]:
+        return {
+            "transport": "http",
+            "running": self._initialized,
+            "pid": None,
+            "protocol_version": self.protocol_version,
+            "protocol_era": self.protocol_era,
+            "server_info": dict(self.server_info),
+            "server_capabilities": dict(self.server_capabilities),
+            "server_instructions": self.server_instructions,
+            "supported_versions": list(self.supported_versions),
+            "session_bound": bool(self._session_id),
+            "tls_verified": self.config.verify_ssl,
+            "ca_file_configured": bool(self.config.ca_file),
+            "tools_dirty": self.tools_dirty,
+            "last_error": self.last_error,
+        }
+
 class MCPClientRegistry:
-    """Loads MCP config, owns stdio clients, and caches virtual tool schemas."""
+    """Loads MCP config, owns stdio/HTTP clients, and caches virtual tool schemas."""
 
     def __init__(self):
         self.config_path = _default_config_path()
@@ -724,6 +1112,12 @@ class MCPClientRegistry:
         self._discovery_started_at: dict[str, float] = {}
         self._discovery_status: dict[str, str] = {}
         atexit.register(self.close_all)
+
+    @staticmethod
+    def _make_client(config: MCPServerConfig) -> StdioMCPClient:
+        if config.transport == "http":
+            return StreamableHTTPMCPClient(config)
+        return StdioMCPClient(config)
 
     @property
     def virtual_tools(self) -> dict[str, MCPVirtualTool]:
@@ -864,7 +1258,7 @@ class MCPClientRegistry:
                 return
             client = self._clients.get(name)
             if client is None:
-                client = StdioMCPClient(cfg)
+                client = self._make_client(cfg)
                 self._clients[name] = client
             self._discovery_status[name] = "running"
             self._discovery_started_at[name] = now
@@ -1006,7 +1400,7 @@ class MCPClientRegistry:
             return f"ERROR: MCP server {mapping.server_name!r} is no longer configured or enabled."
         client = self._clients.get(mapping.server_name)
         if client is None:
-            client = StdioMCPClient(cfg)
+            client = self._make_client(cfg)
             self._clients[mapping.server_name] = client
         try:
             result = client.call_tool(mapping.tool_name, arguments or {})
