@@ -17,7 +17,9 @@ with tempfile.TemporaryDirectory(prefix="mcp-plugin-check-") as temporary:
     common = root / "plugins/common"
     common.mkdir(parents=True)
     (common / "mcp_client.py").symlink_to(source)
-    env = dict(os.environ, AGENT_ZOO_HOME=str(root / "home"))
+    config = root / "mcp.json"
+    config.write_text(json.dumps({"mcpServers": {"offline": {"command": "unused", "enabled": False}}}))
+    env = dict(os.environ, AGENT_ZOO_HOME=str(root / "home"), AZO_MCP_CONFIG=str(config))
     result = subprocess.run([
         sys.executable, str(scripts / "inspect_agent_zoo_plugins.py"),
         "--repo-root", str(host), "--plugin-root", str(root / "plugins"),
@@ -33,5 +35,6 @@ with tempfile.TemporaryDirectory(prefix="mcp-plugin-check-") as temporary:
     for name, pipeline in report["pipelines"].items():
         encoded = json.dumps(pipeline)
         assert "mcp_client_addon" in encoded, (name, pipeline)
+        assert "mcp_settings" in encoded, (name, pipeline)
         assert "mcp_enabled_tools" in encoded, (name, pipeline)
         print(f"{name}: MCP plugin registered; session selection state initialized")
