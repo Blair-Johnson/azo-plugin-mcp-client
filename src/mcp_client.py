@@ -1284,7 +1284,7 @@ class MCPVirtualToolRouter(Tool):
 def _settings_document():
     """Read the authoritative path without the runtime loader's lenient fallback."""
     try:
-        path = _default_config_path().resolve()
+        path = _default_config_path()
         try:
             text = path.read_text(encoding="utf-8")
         except FileNotFoundError:
@@ -1343,8 +1343,12 @@ def _server_setting(name, field, value=None):
             text = yaml.safe_dump(document, sort_keys=False)
         else:
             text = json.dumps(document, ensure_ascii=False, indent=2) + "\n"
-        # Resolve symlinks above; replace the target, retaining existing permissions.
-        mode = path.stat().st_mode & 0o7777
+        # Bundled examples are read-only defaults, unless explicitly selected via env.
+        if not os.environ.get(_CONFIG_ENV, "").strip() and path.parent == _PLUGIN_ROOT:
+            path = _user_config_dir() / path.name
+        path = path.resolve()  # Preserve existing symlinks by replacing their target.
+        path.parent.mkdir(parents=True, exist_ok=True)
+        mode = path.stat().st_mode & 0o7777 if path.exists() else 0o600
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
                                          prefix=".mcp-settings-", delete=False) as stream:
             temporary = Path(stream.name)
