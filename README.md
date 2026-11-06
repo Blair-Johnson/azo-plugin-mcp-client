@@ -38,3 +38,22 @@ pixi run --manifest-path /path/to/agent-zoo/pixi.toml -e agent-zoo-plugins pytho
 ```
 
 The plugin does not implement a general-purpose tool-search system or rely on embeddings. Explicitly enabling a large set can still produce a large model request; enable only the endpoints needed for the task.
+
+## `/config` settings
+
+Each configured server exposes **Enabled** (boolean) and **Timeout (ms)**
+(integer, 1000–600000). These are configured values, applied by the existing MCP
+configuration poll on the next pipeline pass or explicit MCP operation; changing
+a value does not itself connect to a server. Reload after adding/removing servers
+to rebuild the settings catalog. Disabled servers remain editable.
+
+Edits use the same `AZO_MCP_CONFIG` / state-home / development-fallback path as
+the runtime, preserve unrelated server and document fields and file permissions,
+and atomically replace the file. JSON/JSONC and YAML are supported; serialization
+may remove comments and change formatting. Invalid/unreadable files fail safely.
+Sub-millisecond or out-of-range configured timeouts are shown as errors, never
+rounded. Concurrent external file edits are not locked (last writer wins).
+
+Commands, arguments, environment, credentials, URLs, paths, prefixes, prompts, and
+arbitrary nested data are intentionally not exposed. An unreadable document has
+a read-only diagnostic row until repaired and reloaded. No servers means no rows.

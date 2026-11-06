@@ -30,6 +30,8 @@ import hashlib
 import json
 import logging
 import os
+import tempfile
+from decimal import Decimal, InvalidOperation
 from collections import deque
 import re
 import shlex
@@ -41,6 +43,7 @@ from typing import Any
 
 from agent_utils import Feature
 from agent_utils.tool import Tool
+from agent_zoo.runtime.settings import Setting, SettingError
 
 log = logging.getLogger("agent_zoo_user_plugin.mcp_client")
 
@@ -1278,7 +1281,117 @@ class MCPVirtualToolRouter(Tool):
         return state
 
 
+def _settings_document():
+    """Read the authoritative path without the runtime loader's lenient fallback."""
+    try:
+        path = _default_config_path().resolve()
+        try:
+            text = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return path, {}
+        if path.suffix.lower() in {".yaml", ".yml"}:
+            import yaml
+            document = yaml.safe_load(text)
+        else:
+            document = json.loads(_strip_json_line_comments(text))
+        if not isinstance(document, dict):
+            raise ValueError
+        servers = document.get("mcpServers", document.get("servers", {}))
+        if servers is not None and (not isinstance(servers, dict)
+                                    or any(not isinstance(name, str) for name in servers)):
+            raise ValueError
+        return path, document
+    except Exception:
+        raise SettingError("Cannot read MCP configuration; repair the file before editing.") from None
+
+
+def _server_setting(name, field, value=None):
+    path, document = _settings_document()
+    servers = document.get("mcpServers", document.get("servers", {})) or {}
+    entry = servers.get(name)
+    if not isinstance(entry, dict):
+        raise SettingError("MCP server configuration changed; reload settings.")
+    key = field
+    if field == "timeout_seconds" and "timeout_seconds" not in entry and "timeout" in entry:
+        key = "timeout"
+    if value is None:
+        raw = entry.get(key, True if field == "enabled" else _DEFAULT_TIMEOUT_SECONDS)
+        if field == "enabled":
+            if type(raw) is not bool:
+                raise SettingError("MCP enabled must be a boolean.")
+            return raw
+        try:
+            milliseconds = Decimal(str(raw)) * 1000
+            if (not milliseconds.is_finite() or milliseconds != milliseconds.to_integral_value()
+                    or not 1000 <= milliseconds <= 600000):
+                raise ValueError
+            return int(milliseconds)
+        except (InvalidOperation, ValueError):
+            raise SettingError("MCP timeout must be exact milliseconds between 1000 and 600000.") from None
+    if field == "enabled":
+        if type(value) is not bool:
+            raise SettingError("MCP enabled must be a boolean.")
+        entry[key] = value
+    else:
+        if type(value) is not int or not 1000 <= value <= 600000:
+            raise SettingError("MCP timeout must be integer milliseconds between 1000 and 600000.")
+        entry[key] = value / 1000
+    temporary = None
+    try:
+        if path.suffix.lower() in {".yaml", ".yml"}:
+            import yaml
+            text = yaml.safe_dump(document, sort_keys=False)
+        else:
+            text = json.dumps(document, ensure_ascii=False, indent=2) + "\n"
+        # Resolve symlinks above; replace the target, retaining existing permissions.
+        mode = path.stat().st_mode & 0o7777
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         prefix=".mcp-settings-", delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(text)
+        temporary.chmod(mode)
+        os.replace(temporary, path)
+    except Exception:
+        raise SettingError("Cannot save MCP configuration.") from None
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _mcp_settings():
+    try:
+        _, document = _settings_document()
+    except SettingError:
+        def unreadable(ctx):
+            raise SettingError("Cannot read MCP configuration; repair the file and reload.")
+        return [Setting("mcp.configuration", "Configuration unavailable", "bool", unreadable,
+                        group="MCP", apply="reload")]
+    settings = []
+    servers = document.get("mcpServers", document.get("servers", {})) or {}
+    for name, entry in servers.items():
+        if not isinstance(entry, dict):
+            continue
+        # Stable keys do not depend on server-name punctuation or disclose connection data.
+        prefix = "mcp.server_" + hashlib.sha256(name.encode()).hexdigest()[:16]
+        for field, label, kind, bounds in (
+            ("enabled", "Enabled", "bool", {}),
+            ("timeout_seconds", "Timeout (ms)", "int", {"min": 1000, "max": 600000}),
+        ):
+            setting_key = "timeout_ms" if field == "timeout_seconds" else field
+            settings.append(Setting(
+                f"{prefix}.{setting_key}", f"{_clean_token(name)[:100]}: {label}", kind,
+                get=lambda ctx, n=name, f=field: _server_setting(n, f),
+                set=lambda ctx, value, n=name, f=field: _server_setting(n, f, value),
+                group="MCP", apply="live",
+                help="Configured value; applied on the next MCP configuration poll/operation. "
+                     "Adding or removing servers requires reloading the settings catalog.",
+                **bounds,
+            ))
+    return settings
+
+
 def register_features(builder, *, session, config):
+    builder.add(Feature(name="mcp_settings", components=_mcp_settings(), order=[Setting]))
     builder.add(Feature(
         name="mcp_client_addon",
         components=[MCPVirtualToolRouter()],
