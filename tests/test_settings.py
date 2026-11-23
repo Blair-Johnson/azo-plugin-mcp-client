@@ -6,21 +6,21 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from agent_utils import Feature, PipelineBuilder, Session
-from agent_utils.builder import flatten
-from agent_zoo.runtime.settings import Setting, SettingsContext, SettingsRegistry
+from agent_utils.core.pipeline import PipelineBuilder
+from agent_utils.core.session import Session
+from agent_utils.features.core import core_feature
+from agent_zoo.features.settings import Setting, SettingsContext, SettingsRegistry, settings_feature
 import mcp_client as mcp
 
 
 def registry():
     session = Session()
-    builder = PipelineBuilder(session)
-    builder.add(Feature("test_tool_slot", order=[mcp.Tool]))
+    builder = PipelineBuilder().add(core_feature()).add(settings_feature())
     with patch.object(mcp.StdioMCPClient, "start", side_effect=AssertionError("no server")):
         mcp.register_features(builder, session=session, config={})
         session.pipeline = builder.build()
-    rows = [c for c in flatten(session.pipeline) if isinstance(c, Setting)]
-    return SettingsRegistry(rows), SettingsContext(session)
+    rows = [c for c in session.pipeline.components if isinstance(c, Setting) and c.key.startswith("mcp.")]
+    return SettingsRegistry(rows), SettingsContext(state=session.state, emit=lambda _ev: None, config={})
 
 
 def request(reg, ctx, action="list", **kw):
@@ -83,8 +83,10 @@ class SettingsTests(unittest.TestCase):
         os.environ["AZO_MCP_CONFIG"] = str(second)
         self.assertTrue(edit(reg, ctx, "enabled", False)["ok"])
         self.assertNotIn("enabled", json.loads(self.path.read_text())["mcpServers"]["test"])
-        self.assertEqual(json.loads(second.read_text()),
-                         {"mcpServers": {"test": {"command": "unused", "enabled": False}}})
+        self.assertEqual(
+            json.loads(second.read_text()),
+            {"mcpServers": {"test": {"command": "unused", "enabled": False}}},
+        )
 
     def test_malformed_never_overwritten(self):
         for bad in ('{"TOKEN":"secret",', '[]', '', '{"mcpServers":[]}'):

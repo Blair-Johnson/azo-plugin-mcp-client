@@ -4,7 +4,12 @@ import importlib.util
 import json
 import os
 from pathlib import Path
-from types import SimpleNamespace
+
+from agent_utils.core.events import InputReceived
+from agent_utils.core.pipeline import PipelineBuilder
+from agent_utils.core.session import Session
+from agent_utils.features.core import core_feature
+from agent_utils.runtime.simulation import SimulationRuntime
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--config", required=True)
@@ -26,30 +31,50 @@ try:
     catalog = {name: tool for name, tool in registry.virtual_tools.items() if tool.server_name == args.server}
     if not catalog:
         raise RuntimeError(f"No catalog: {registry._discovery_status.get(args.server)}")
-    session = SimpleNamespace(tool_schemas={}, pending_tool_calls=[], mcp_enabled_tools=[])
-    router = mcp.MCPVirtualToolRouter(registry)
-    router(session)
-    before = len(session.tool_schemas)
-    assert before == 4, session.tool_schemas.keys()
+    shared_catalog = mcp.MCPCatalog(registry.virtual_tools)
+    pipeline = (
+        PipelineBuilder()
+        .add(core_feature(batch_deadline_s=None))
+        .add(mcp.mcp_client_feature(catalog=shared_catalog, include_driver=False))
+        .build()
+    )
+    session = Session(pipeline=pipeline)
+    session.ensure_initialized()
+    session.render()
+    before = len(session.state.tool_schemas)
+    assert before == 4, session.state.tool_schemas.keys()
     found = registry.search_tools(server=args.server, limit=3)
     assert found["matches"]
     selected = found["matches"][0]["name"]
-    call = SimpleNamespace(
-        name="enable_mcp_tool", parsed_args={"tool": [selected]},
-        result=None, error=False, started_at=None, finished_at=None,
-    )
-    session.pending_tool_calls = [call]
-    router(session)
+    sim = SimulationRuntime(session)
+    sim.inject(InputReceived(message={
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {
+                "id": "probe_enable",
+                "type": "function",
+                "function": {"name": "enable_mcp_tool", "arguments": json.dumps({"tool": [selected]})},
+            }
+        ],
+    }))
+    sim.run_until_idle()
+    call = session.state.last_tool_calls[-1]
     assert not call.error, call.result
-    after = len(session.tool_schemas)
-    assert after == 5 and selected in session.tool_schemas
-    assert set(catalog) & session.tool_schemas.keys() == {selected}
+    after = len(session.state.tool_schemas)
+    assert after == 5 and selected in session.state.tool_schemas
+    assert set(catalog) & session.state.tool_schemas.keys() == {selected}
     client = registry._clients[args.server]
     print(json.dumps({
-        "kind": "final", "server": args.server, "protocol_version": client.protocol_version,
-        "protocol_era": client.protocol_era, "catalog_tools": len(catalog),
+        "kind": "final",
+        "server": args.server,
+        "protocol_version": client.protocol_version,
+        "protocol_era": client.protocol_era,
+        "catalog_tools": len(catalog),
         "catalog_schema_bytes": len(json.dumps([item.schema for item in catalog.values()]).encode()),
-        "visible_before": before, "visible_after": after, "selected": selected,
+        "visible_before": before,
+        "visible_after": after,
+        "selected": selected,
         "endpoint_calls": 0,
     }))
 finally:

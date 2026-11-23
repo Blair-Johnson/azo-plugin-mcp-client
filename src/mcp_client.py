@@ -1,8 +1,27 @@
-"""Userspace MCP client addon for agent-zoo.
+"""Userspace MCP client addon for agent-zoo (Sans-I/O event-driven architecture).
 
 This plugin discovers MCP tools into a searchable catalog, publishes only
 session-enabled endpoints, and routes their calls over MCP ``tools/call``.
 Discovery is explicit or background-only so unreliable servers cannot stall turns.
+
+Architecture:
+- Pure Sans-I/O pipeline layer:
+  * Typed ``MCP*Request`` IO requests (subclasses of ``IoRequest``) and
+    ``MCPCatalogUpdated`` event (subclass of ``Event``).
+  * Four management ``Tool`` subclasses (``mcp_status``, ``mcp_refresh``,
+    ``search_mcp``, ``enable_mcp_tool``) that yield ``MCP*Request``s or mutate
+    session state purely without performing OS/network/subprocess IO.
+  * ``MCPVirtualToolRouter`` component (ordered after ``Tool``, before
+    ``UnknownToolFallback``) routing enabled virtual ``mcp_*`` endpoint calls
+    via ``MCPCallToolRequest``.
+  * ``MCPToolSchemaPublisher`` component (ordered after ``SchemaPublisher``)
+    publishing only explicitly enabled virtual MCP schemas onto
+    ``state.tool_schemas`` and stripping legacy eager MCP schemas.
+- External IO runtime layer:
+  * ``MCPClientDriver`` (subclass of ``agent_utils.runtime.driver.Driver``),
+    contributed via ``Feature(..., drivers=[...])``, owning ``MCPClientRegistry``,
+    ``StdioMCPClient``, ``StreamableHTTPMCPClient``, config loading, background
+    discovery threads, and clean shutdown on ``close()``.
 
 Configuration defaults to the installed user config at
 ``plugin-configs/azo-plugin-mcp-client/mcp_servers.json`` with the plugin source
@@ -23,27 +42,41 @@ runtime. YAML configs are supported opportunistically when PyYAML is already
 installed by agent-zoo, but JSON configs require no optional imports.
 """
 
-from __future__ import annotations
-
 import atexit
+from collections import deque
+from collections.abc import Callable, Iterable
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 import hashlib
 import json
 import logging
 import os
-import tempfile
-from decimal import Decimal, InvalidOperation
-from collections import deque
+from pathlib import Path
 import re
 import shlex
 import subprocess
+import tempfile
 import threading
 import time
-from pathlib import Path
 from typing import Any
 
-from agent_utils import Feature
-from agent_utils.tool import Tool
-from agent_zoo.runtime.settings import Setting, SettingError
+from agent_utils.core.events import (
+    Event,
+    IoCompleted,
+    IoFailed,
+    RenderRequested,
+    RunToolCall,
+    ToolCallFinished,
+    TurnSettled,
+)
+from agent_utils.core.io import IoRequest, OpId
+from agent_utils.core.pipeline import EmitFn, Feature
+from agent_utils.core.state import State, ToolCall
+from agent_utils.core.tool import Tool
+from agent_utils.features.core import SchemaPublisher, UnknownToolFallback
+from agent_utils.runtime.driver import Driver
+from agent_zoo.features.settings import Setting, SettingError
 
 log = logging.getLogger("agent_zoo_user_plugin.mcp_client")
 
@@ -68,6 +101,13 @@ _CONFIG_POLL_SECONDS = 2.0
 _DISCOVERY_RETRY_SECONDS = 60.0
 _DEFAULT_REFRESH_WAIT_SECONDS = 0.0
 _MAX_FUNCTION_NAME = 64
+_RESERVED_CONTROL_NAMES = frozenset({
+    "mcp_status",
+    "mcp_refresh",
+    "search_mcp",
+    "enable_mcp_tool",
+    "mcp_virtual_tool_router",
+})
 
 
 class MCPError(RuntimeError):
@@ -171,6 +211,8 @@ def _json_dump(value: Any) -> str:
 
 def _compact_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
 def _strip_json_line_comments(text: str) -> str:
     """Remove // comments outside JSON strings, allowing JSONC-style config."""
     lines: list[str] = []
@@ -213,7 +255,6 @@ def _shorten_tool_name(name: str) -> str:
     return f"{name[:keep].rstrip('_-')}_{digest}"
 
 
-
 def _agent_zoo_data_root() -> Path:
     for env_name in ("AGENT_ZOO_HOME", "AGENT_ZOO_STATE_ROOT"):
         env_path = os.environ.get(env_name, "").strip()
@@ -224,6 +265,8 @@ def _agent_zoo_data_root() -> Path:
 
 def _user_config_dir() -> Path:
     return _agent_zoo_data_root() / "plugin-configs" / _PLUGIN_NAME
+
+
 def _default_config_path() -> Path:
     env_path = os.environ.get(_CONFIG_ENV, "").strip()
     if env_path:
@@ -339,7 +382,7 @@ def _normalize_config(raw: dict[str, Any]) -> dict[str, MCPServerConfig]:
             if transport_name in _HTTP_TRANSPORT_NAMES:
                 transport = "http"
                 command = None
-                args = ()
+                args: tuple[str, ...] = ()
                 url = _normalize_http_url(raw_entry.get("url"))
                 headers = _expand_header_map(raw_entry.get("headers"))
                 verify_ssl = raw_entry.get("verify_ssl", raw_entry.get("tls_verify", True))
@@ -359,7 +402,7 @@ def _normalize_config(raw: dict[str, Any]) -> dict[str, MCPServerConfig]:
                 verify_ssl = True
                 ca_file = None
             elif transport_name == "sse":
-                raise MCPError("legacy SSE MCP transport is not supported; use Streamable HTTP (type=\"http\")")
+                raise MCPError('legacy SSE MCP transport is not supported; use Streamable HTTP (type="http")')
             else:
                 raise MCPError(f"unsupported MCP transport {raw_transport!r}")
             cwd = raw_entry.get("cwd")
@@ -384,6 +427,11 @@ def _normalize_config(raw: dict[str, Any]) -> dict[str, MCPServerConfig]:
         except Exception as exc:
             log.warning("Ignoring invalid MCP server config for %s: %s", raw_name, exc)
     return servers
+
+
+# ---------------------------------------------------------------------------
+# External IO transport clients (owned exclusively by MCPClientDriver)
+# ---------------------------------------------------------------------------
 
 class StdioMCPClient:
     """Synchronous stdio client for modern and initialization-based MCP."""
@@ -428,9 +476,16 @@ class StdioMCPClient:
             argv = [self.config.command, *self.config.args]
             try:
                 proc = subprocess.Popen(
-                    argv, cwd=self.config.cwd or None, env=env,
-                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                    text=True, encoding="utf-8", errors="replace", bufsize=1,
+                    argv,
+                    cwd=self.config.cwd or None,
+                    env=env,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    bufsize=1,
                 )
             except Exception as exc:
                 self.last_error = f"failed to start MCP server {self.config.name}: {exc}"
@@ -438,12 +493,16 @@ class StdioMCPClient:
             self.process = proc
             self._stdout_closed = False
             self._stdout_thread = threading.Thread(
-                target=self._stdout_loop, args=(proc,),
-                name=f"mcp-stdout-{self.config.name}", daemon=True,
+                target=self._stdout_loop,
+                args=(proc,),
+                name=f"mcp-stdout-{self.config.name}",
+                daemon=True,
             )
             self._stderr_thread = threading.Thread(
-                target=self._stderr_loop, args=(proc,),
-                name=f"mcp-stderr-{self.config.name}", daemon=True,
+                target=self._stderr_loop,
+                args=(proc,),
+                name=f"mcp-stderr-{self.config.name}",
+                daemon=True,
             )
             try:
                 self._stdout_thread.start()
@@ -641,8 +700,14 @@ class StdioMCPClient:
             # Legacy initialize cannot be cancelled. Every other request can.
             if method != "initialize":
                 try:
-                    self._send_raw({"jsonrpc": "2.0", "method": "notifications/cancelled",
-                                    "params": {"requestId": request_id, "reason": "Request timed out"}}, proc=proc)
+                    self._send_raw(
+                        {
+                            "jsonrpc": "2.0",
+                            "method": "notifications/cancelled",
+                            "params": {"requestId": request_id, "reason": "Request timed out"},
+                        },
+                        proc=proc,
+                    )
                 except MCPError:
                     pass
             raise
@@ -715,10 +780,14 @@ class StdioMCPClient:
             # not just -32601. Transport failures/malformed success do not.
             self.protocol_era = "legacy"
             self.protocol_version = None
-            result = self._request("initialize", {
-                "protocolVersion": _LEGACY_PROTOCOL_VERSIONS[0],
-                "capabilities": {}, "clientInfo": dict(_CLIENT_INFO),
-            })
+            result = self._request(
+                "initialize",
+                {
+                    "protocolVersion": _LEGACY_PROTOCOL_VERSIONS[0],
+                    "capabilities": {},
+                    "clientInfo": dict(_CLIENT_INFO),
+                },
+            )
             version = result.get("protocolVersion")
             if version not in _LEGACY_PROTOCOL_VERSIONS:
                 raise MCPError(f"MCP server {self.config.name} selected unsupported legacy version {version!r}")
@@ -765,8 +834,11 @@ class StdioMCPClient:
         self.start()
         if self.protocol_era == "legacy" and "tools" not in self.server_capabilities:
             raise MCPError(f"MCP server {self.config.name} does not advertise tools")
-        result = self._request("tools/call", {"name": tool_name, "arguments": arguments or {}},
-                               timeout=self.config.timeout_seconds)
+        result = self._request(
+            "tools/call",
+            {"name": tool_name, "arguments": arguments or {}},
+            timeout=self.config.timeout_seconds,
+        )
         self.last_error = None
         return result
 
@@ -788,6 +860,7 @@ class StdioMCPClient:
             "last_error": self.last_error,
             "stderr_tail": self.stderr_tail(),
         }
+
 
 class StreamableHTTPMCPClient(StdioMCPClient):
     """MCP client for the Streamable HTTP transport.
@@ -1097,10 +1170,15 @@ class StreamableHTTPMCPClient(StdioMCPClient):
             "last_error": self.last_error,
         }
 
+
 class MCPClientRegistry:
     """Loads MCP config, owns stdio/HTTP clients, and caches virtual tool schemas."""
 
-    def __init__(self):
+    def __init__(
+        self,
+        *,
+        on_catalog_change: Callable[[dict[str, MCPVirtualTool]], None] | None = None,
+    ):
         self.config_path = _default_config_path()
         self._config_mtime_ns: int | None = None
         self._last_config_check = 0.0
@@ -1114,6 +1192,7 @@ class MCPClientRegistry:
         self._discovery_threads: dict[str, threading.Thread] = {}
         self._discovery_started_at: dict[str, float] = {}
         self._discovery_status: dict[str, str] = {}
+        self._on_catalog_change = on_catalog_change
         atexit.register(self.close_all)
 
     @staticmethod
@@ -1127,6 +1206,14 @@ class MCPClientRegistry:
         with self._lock:
             return dict(self._virtual_tools)
 
+    def _emit_catalog_change(self, snapshot: dict[str, MCPVirtualTool]) -> None:
+        cb = self._on_catalog_change
+        if cb is not None:
+            try:
+                cb(snapshot)
+            except Exception:
+                log.debug("MCP catalog change callback failed", exc_info=True)
+
     def close_all(self) -> None:
         with self._lock:
             clients = list(self._clients.values())
@@ -1138,6 +1225,7 @@ class MCPClientRegistry:
         server: str | None = None,
         force: bool = False,
         wait_seconds: float | None = _DEFAULT_REFRESH_WAIT_SECONDS,
+        enabled: Iterable[str] | None = None,
     ) -> str:
         self._load_config(force=True)
         names: list[str]
@@ -1152,14 +1240,14 @@ class MCPClientRegistry:
         for name in names:
             self._schedule_discovery(name, force=force)
         self._wait_for_discovery(names, wait_seconds or 0.0)
-        return self.status_text()
+        return self.status_text(enabled=set(enabled) if enabled is not None else None)
 
     def sync_for_publish(self) -> None:
-        # This method is called on every pipeline pass while publishing tool
-        # schemas. It must never perform network I/O or launch MCP servers.
+        # Poll config without ever performing network I/O or launching MCP servers.
         self._load_config(force=False)
 
     def _load_config(self, force: bool = False) -> None:
+        catalog_snapshot: dict[str, MCPVirtualTool] | None = None
         with self._lock:
             now = time.monotonic()
             if not force and now - self._last_config_check < _CONFIG_POLL_SECONDS:
@@ -1201,9 +1289,13 @@ class MCPClientRegistry:
 
             self._servers = servers
             self._config_mtime_ns = mtime_ns
+            if removed or changed:
+                catalog_snapshot = dict(self._virtual_tools)
 
         for client in clients_to_close:
             client.close()
+        if catalog_snapshot is not None:
+            self._emit_catalog_change(catalog_snapshot)
 
     def _discover_all(self, force: bool = False) -> None:
         with self._lock:
@@ -1213,27 +1305,33 @@ class MCPClientRegistry:
 
     def _schedule_discovery(self, name: str, force: bool = False) -> None:
         now = time.monotonic()
+        catalog_snapshot: dict[str, MCPVirtualTool] | None = None
         with self._lock:
             cfg = self._servers.get(name)
             if cfg is None or not cfg.enabled:
+                had_virtuals = bool(self._server_virtuals.get(name))
                 self._remove_server_virtuals(name)
                 self._discovery_status[name] = "disabled"
-                return
-            thread = self._discovery_threads.get(name)
-            if thread is not None and thread.is_alive():
-                return
-            if not force and now < self._next_retry_at.get(name, 0.0):
-                return
-            self._discovery_status[name] = "queued"
-            thread = threading.Thread(
-                target=self._discover_server,
-                args=(name, force),
-                name=f"mcp-discover-{name}",
-                daemon=True,
-            )
-            self._discovery_threads[name] = thread
-            self._discovery_started_at[name] = now
-            thread.start()
+                if had_virtuals:
+                    catalog_snapshot = dict(self._virtual_tools)
+            else:
+                thread = self._discovery_threads.get(name)
+                if thread is not None and thread.is_alive():
+                    return
+                if not force and now < self._next_retry_at.get(name, 0.0):
+                    return
+                self._discovery_status[name] = "queued"
+                thread = threading.Thread(
+                    target=self._discover_server,
+                    args=(name, force),
+                    name=f"mcp-discover-{name}",
+                    daemon=True,
+                )
+                self._discovery_threads[name] = thread
+                self._discovery_started_at[name] = now
+                thread.start()
+        if catalog_snapshot is not None:
+            self._emit_catalog_change(catalog_snapshot)
 
     def _wait_for_discovery(self, names: list[str], wait_seconds: float) -> None:
         if wait_seconds <= 0:
@@ -1281,6 +1379,7 @@ class MCPClientRegistry:
                     self._discovery_threads.pop(name, None)
             log.warning("Could not discover tools for MCP server %s: %s", name, exc)
             return
+        catalog_snapshot: dict[str, MCPVirtualTool] | None = None
         with self._lock:
             if self._clients.get(name) is not client or self._servers.get(name) != cfg:
                 if self._discovery_threads.get(name) is threading.current_thread():
@@ -1292,6 +1391,9 @@ class MCPClientRegistry:
             current = threading.current_thread()
             if self._discovery_threads.get(name) is current:
                 self._discovery_threads.pop(name, None)
+            catalog_snapshot = dict(self._virtual_tools)
+        if catalog_snapshot is not None:
+            self._emit_catalog_change(catalog_snapshot)
 
     def _remove_server_virtuals(self, server_name: str) -> None:
         for virtual_name in self._server_virtuals.pop(server_name, set()):
@@ -1299,11 +1401,8 @@ class MCPClientRegistry:
 
     def _install_virtual_tools(self, server_name: str, tools: list[dict[str, Any]]) -> None:
         self._remove_server_virtuals(server_name)
-        cfg = self._servers[server_name]
         installed: set[str] = set()
-        used_names = set(self._virtual_tools) | {
-            "mcp_status", "mcp_refresh", "search_mcp", "enable_mcp_tool", "mcp_virtual_tool_router",
-        }
+        used_names = set(self._virtual_tools) | _RESERVED_CONTROL_NAMES
         for tool in tools:
             raw_name = str(tool.get("name") or "").strip()
             if not raw_name:
@@ -1352,25 +1451,28 @@ class MCPClientRegistry:
         }
 
     def search_tools(
-        self, query: str = "", server: str | None = None, limit: int = 20,
+        self,
+        query: str = "",
+        server: str | None = None,
+        limit: int = 20,
         offset: int = 0,
     ) -> dict[str, Any]:
         """Search names/descriptions; discover missing or dirty catalogs, never call tools."""
-        if not isinstance(query, str) or (server is not None and not isinstance(server, str)):
-            raise MCPError("query and server must be strings")
-        if type(limit) is not int or not 1 <= limit <= 50:
-            raise MCPError("limit must be an integer from 1 to 50")
-        if type(offset) is not int or offset < 0:
-            raise MCPError("offset must be a nonnegative integer")
+        _validate_search_args(query=query, server=server, limit=limit, offset=offset)
         self._load_config(force=False)
         with self._lock:
             if server is not None and _clean_token(server) not in self._servers:
                 raise MCPError(f"unknown MCP server {server!r}")
             names = [_clean_token(server)] if server is not None else sorted(self._servers)
-            discover = [name for name in names if self._servers[name].enabled and (
-                name not in self._server_virtuals
-                or getattr(self._clients.get(name), "tools_dirty", False)
-            )]
+            discover = [
+                name
+                for name in names
+                if self._servers[name].enabled
+                and (
+                    name not in self._server_virtuals
+                    or getattr(self._clients.get(name), "tools_dirty", False)
+                )
+            ]
         for name in discover:
             self._schedule_discovery(name)
         self._wait_for_discovery(discover, 1.0)
@@ -1384,27 +1486,35 @@ class MCPClientRegistry:
                 if not all(term in text for term in terms):
                     continue
                 matches.append({
-                    "name": tool.virtual_name, "server": tool.server_name,
-                    "tool": tool.tool_name, "description": tool.description[:320],
+                    "name": tool.virtual_name,
+                    "server": tool.server_name,
+                    "tool": tool.tool_name,
+                    "description": tool.description[:320],
                 })
             return {
-                "matches": matches[offset:offset + limit], "total": len(matches),
+                "matches": matches[offset : offset + limit],
+                "total": len(matches),
                 "next_offset": offset + limit if offset + limit < len(matches) else None,
-                "discovery": {name: self._discovery_status.get(name, "idle") if self._servers[name].enabled else "disabled" for name in names if name in self._servers},
+                "discovery": {
+                    name: self._discovery_status.get(name, "idle") if self._servers[name].enabled else "disabled"
+                    for name in names
+                    if name in self._servers
+                },
                 "config_error": self._config_error,
             }
 
     def call_virtual_tool(self, virtual_name: str, arguments: dict[str, Any]) -> str:
-        mapping = self._virtual_tools.get(virtual_name)
-        if mapping is None:
-            return f"ERROR: unknown MCP virtual tool {virtual_name!r}. Run mcp_refresh and mcp_status."
-        cfg = self._servers.get(mapping.server_name)
-        if cfg is None or not cfg.enabled:
-            return f"ERROR: MCP server {mapping.server_name!r} is no longer configured or enabled."
-        client = self._clients.get(mapping.server_name)
-        if client is None:
-            client = self._make_client(cfg)
-            self._clients[mapping.server_name] = client
+        with self._lock:
+            mapping = self._virtual_tools.get(virtual_name)
+            if mapping is None:
+                return f"ERROR: unknown MCP virtual tool {virtual_name!r}. Run mcp_refresh and mcp_status."
+            cfg = self._servers.get(mapping.server_name)
+            if cfg is None or not cfg.enabled:
+                return f"ERROR: MCP server {mapping.server_name!r} is no longer configured or enabled."
+            client = self._clients.get(mapping.server_name)
+            if client is None:
+                client = self._make_client(cfg)
+                self._clients[mapping.server_name] = client
         try:
             result = client.call_tool(mapping.tool_name, arguments or {})
             return _format_call_result(mapping, result)
@@ -1412,8 +1522,9 @@ class MCPClientRegistry:
             client.last_error = str(exc)
             return f"ERROR: MCP tool {mapping.server_name}/{mapping.tool_name} failed: {exc}"
 
-    def status_text(self, enabled: set[str] | None = None) -> str:
+    def status_text(self, enabled: Iterable[str] | None = None) -> str:
         self._load_config(force=False)
+        enabled_set = set(enabled) if enabled is not None else None
         lines = []
         with self._lock:
             if self._config_error:
@@ -1427,13 +1538,17 @@ class MCPClientRegistry:
                     phase = "discovering"
                 if not cfg.enabled:
                     phase = "disabled"
-                if phase == "connected" and client.protocol_version:
+                if phase == "connected" and client is not None and client.protocol_version:
                     phase += f" (MCP {client.protocol_version})"
                 tools = self._server_virtuals.get(name)
-                catalog = "catalog not loaded" if tools is None else f"{len(tools)} {'cached ' if not running else ''}tool{'s' if len(tools) != 1 else ''}"
+                catalog = (
+                    "catalog not loaded"
+                    if tools is None
+                    else f"{len(tools)} {'cached ' if not running else ''}tool{'s' if len(tools) != 1 else ''}"
+                )
                 parts = [f"{name}: {phase}", catalog]
-                if enabled is not None:
-                    parts.append(f"{len((tools or set()) & enabled)} enabled")
+                if enabled_set is not None:
+                    parts.append(f"{len((tools or set()) & enabled_set)} enabled")
                 if tools is not None and client is not None and client.tools_dirty:
                     parts.append("catalog stale; search to refresh")
                 error = discovery if discovery.startswith("error:") else (client.last_error if client else None)
@@ -1448,9 +1563,28 @@ class MCPClientRegistry:
         return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# Pure formatting & validation helpers
+# ---------------------------------------------------------------------------
+
+def _validate_search_args(
+    *,
+    query: Any = "",
+    server: Any = None,
+    limit: Any = 20,
+    offset: Any = 0,
+) -> None:
+    if not isinstance(query, str) or (server is not None and not isinstance(server, str)):
+        raise MCPError("query and server must be strings")
+    if type(limit) is not int or not 1 <= limit <= 50:
+        raise MCPError("limit must be an integer from 1 to 50")
+    if type(offset) is not int or offset < 0:
+        raise MCPError("offset must be a nonnegative integer")
+
+
 def _brief(text: Any, limit: int = 200) -> str:
     text = " ".join(str(text).split())
-    return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
 def _format_search_result(result: dict[str, Any], enabled: set[str]) -> str:
@@ -1512,168 +1646,647 @@ def _format_call_result(mapping: MCPVirtualTool, result: dict[str, Any]) -> str:
             lines.append(_json_dump(result))
     return "\n".join(line for line in lines if line is not None)
 
-class MCPVirtualToolRouter(Tool):
-    """Publish virtual MCP tools and route matching calls to MCP servers."""
 
-    name = "mcp_virtual_tool_router"
-    description = "Publish and route virtual tools backed by configured MCP servers."
+# ---------------------------------------------------------------------------
+# Pure Sans-I/O Events, IoRequests, Outcomes, and In-Memory Catalog
+# ---------------------------------------------------------------------------
+
+@dataclass
+class MCPRequest(IoRequest):
+    """Base class for all MCP client driver IO requests."""
+
+
+@dataclass
+class MCPStatusRequest(MCPRequest):
+    """Request formatted MCP server status text."""
+
+    enabled: tuple[str, ...] = ()
+
+
+@dataclass
+class MCPRefreshRequest(MCPRequest):
+    """Reload MCP config and schedule discovery for one or all servers."""
+
+    server: str | None = None
+    force: bool = True
+    wait_seconds: float = 0.0
+    enabled: tuple[str, ...] | None = None
+
+
+@dataclass
+class MCPSearchRequest(MCPRequest):
+    """Search the MCP tool catalog (discovering missing/dirty servers with bounded wait)."""
+
+    query: str = ""
+    server: str | None = None
+    limit: int = 20
+    offset: int = 0
+
+
+@dataclass
+class MCPCallToolRequest(MCPRequest):
+    """Invoke a published virtual MCP endpoint over MCP ``tools/call``."""
+
+    virtual_name: str
+    arguments: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class MCPSyncCatalogRequest(MCPRequest):
+    """Poll MCP config without starting servers and return the current catalog snapshot."""
+
+    force: bool = False
+
+
+@dataclass(frozen=True)
+class MCPStatusResult:
+    """Driver response for ``MCPStatusRequest``."""
+
+    text: str
+    catalog: dict[str, MCPVirtualTool] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class MCPRefreshResult:
+    """Driver response for ``MCPRefreshRequest``."""
+
+    text: str
+    catalog: dict[str, MCPVirtualTool] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class MCPSearchResult:
+    """Driver response for ``MCPSearchRequest``."""
+
+    result: dict[str, Any]
+    catalog: dict[str, MCPVirtualTool] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class MCPCallResult:
+    """Driver response for ``MCPCallToolRequest``."""
+
+    text: str
+    is_error: bool = False
+    catalog: dict[str, MCPVirtualTool] | None = None
+
+
+@dataclass(frozen=True)
+class MCPSyncResult:
+    """Driver response for ``MCPSyncCatalogRequest``."""
+
+    catalog: dict[str, MCPVirtualTool] = field(default_factory=dict)
+
+
+@dataclass
+class MCPCatalogUpdated(Event):
+    """Event emitted when the discovered MCP virtual tool catalog changes."""
+
+    catalog: dict[str, MCPVirtualTool] = field(default_factory=dict)
+
+
+class MCPCatalog:
+    """Pure in-memory view of discovered virtual MCP tools shared by pipeline components.
+
+    Contains only pure schema metadata (zero subprocesses, sockets, threads, or
+    file I/O). Kept outside durable ``State`` attributes so session persistence
+    records only explicit user selections (``state.mcp_enabled_tools``).
+    """
+
+    def __init__(self, tools: dict[str, MCPVirtualTool] | None = None) -> None:
+        self._virtual_tools: dict[str, MCPVirtualTool] = dict(tools or {})
+
+    @property
+    def virtual_tools(self) -> dict[str, MCPVirtualTool]:
+        return dict(self._virtual_tools)
+
+    def update(self, tools: dict[str, MCPVirtualTool]) -> None:
+        self._virtual_tools = dict(tools)
+
+    def get(self, name: str) -> MCPVirtualTool | None:
+        return self._virtual_tools.get(name)
+
+    def __contains__(self, name: object) -> bool:
+        return name in self._virtual_tools
+
+
+# ---------------------------------------------------------------------------
+# Runtime Driver (imperative IO shell)
+# ---------------------------------------------------------------------------
+
+class MCPClientDriver(Driver):
+    """Runtime IO driver owning ``MCPClientRegistry`` and executing ``MCPRequest``s."""
+
+    request_types = (MCPRequest,)
+
+    def __init__(
+        self,
+        registry: MCPClientRegistry | None = None,
+        *,
+        max_workers: int = 4,
+    ) -> None:
+        super().__init__()
+        self.registry = registry if registry is not None else MCPClientRegistry()
+        self._max_workers = max(1, int(max_workers))
+        self._lock = threading.Lock()
+        self._executor: ThreadPoolExecutor | None = None
+        self._futures: dict[OpId, Future[Any]] = {}
+        self._cancelled: set[OpId] = set()
+        self._closed = False
+
+    def start(self, emit: EmitFn) -> None:
+        super().start(emit)
+        with self._lock:
+            self._closed = False
+            if self._executor is None:
+                self._executor = ThreadPoolExecutor(
+                    max_workers=self._max_workers,
+                    thread_name_prefix="agent-zoo-mcp",
+                )
+        self.registry._on_catalog_change = self._on_catalog_change
+        initial = self.registry.virtual_tools
+        if initial:
+            self._safe_emit(MCPCatalogUpdated(catalog=initial))
+
+    def _on_catalog_change(self, catalog: dict[str, MCPVirtualTool]) -> None:
+        with self._lock:
+            if self._closed:
+                return
+        self._safe_emit(MCPCatalogUpdated(catalog=dict(catalog)))
+
+    def submit(self, op_id: OpId, req: IoRequest) -> None:
+        if not isinstance(req, MCPRequest):
+            raise TypeError(f"MCPClientDriver expected MCPRequest, got {type(req).__name__}")
+        with self._lock:
+            if self._closed or op_id in self._cancelled:
+                return
+            if self._executor is None:
+                self._executor = ThreadPoolExecutor(
+                    max_workers=self._max_workers,
+                    thread_name_prefix="agent-zoo-mcp",
+                )
+            fut = self._executor.submit(self._execute, op_id, req)
+            self._futures[op_id] = fut
+
+    def cancel(self, op_id: OpId) -> None:
+        with self._lock:
+            self._cancelled.add(op_id)
+            fut = self._futures.get(op_id)
+        if fut is not None:
+            fut.cancel()
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+            futures = list(self._futures.values())
+            self._cancelled.update(self._futures.keys())
+            self._futures.clear()
+            executor = self._executor
+            self._executor = None
+        self.registry._on_catalog_change = None
+        for fut in futures:
+            fut.cancel()
+        try:
+            self.registry.close_all()
+        finally:
+            if executor is not None:
+                executor.shutdown(wait=True, cancel_futures=True)
+            with self._lock:
+                self._cancelled.clear()
+
+    def _is_fenced(self, op_id: OpId) -> bool:
+        with self._lock:
+            return self._closed or op_id in self._cancelled
+
+    def _execute(self, op_id: OpId, req: MCPRequest) -> None:
+        try:
+            if self._is_fenced(op_id):
+                return
+            value = self._dispatch_request(req)
+            if self._is_fenced(op_id):
+                return
+            self._safe_emit(IoCompleted(op_id=op_id, value=value))
+        except Exception as exc:
+            if not self._is_fenced(op_id):
+                self._safe_emit(IoFailed(op_id=op_id, error=exc))
+        finally:
+            with self._lock:
+                self._futures.pop(op_id, None)
+                self._cancelled.discard(op_id)
+
+    def _dispatch_request(self, req: MCPRequest) -> Any:
+        if isinstance(req, MCPStatusRequest):
+            text = self.registry.status_text(enabled=set(req.enabled))
+            return MCPStatusResult(text=text, catalog=self.registry.virtual_tools)
+        if isinstance(req, MCPRefreshRequest):
+            text = self.registry.refresh(
+                server=req.server,
+                force=req.force,
+                wait_seconds=req.wait_seconds,
+                enabled=req.enabled,
+            )
+            return MCPRefreshResult(text=text, catalog=self.registry.virtual_tools)
+        if isinstance(req, MCPSearchRequest):
+            result = self.registry.search_tools(
+                query=req.query,
+                server=req.server,
+                limit=req.limit,
+                offset=req.offset,
+            )
+            return MCPSearchResult(result=result, catalog=self.registry.virtual_tools)
+        if isinstance(req, MCPCallToolRequest):
+            text = self.registry.call_virtual_tool(req.virtual_name, dict(req.arguments))
+            is_error = text.startswith(("ERROR:", "MCP TOOL ERROR"))
+            return MCPCallResult(text=text, is_error=is_error, catalog=self.registry.virtual_tools)
+        if isinstance(req, MCPSyncCatalogRequest):
+            if req.force:
+                self.registry._load_config(force=True)
+            else:
+                self.registry.sync_for_publish()
+            return MCPSyncResult(catalog=self.registry.virtual_tools)
+        raise TypeError(f"Unsupported MCPRequest: {type(req).__name__}")
+
+
+# ---------------------------------------------------------------------------
+# Pure Sans-I/O Pipeline Tools & Event Components
+# ---------------------------------------------------------------------------
+
+def _enabled_names(state: State) -> set[str]:
+    names = getattr(state, "mcp_enabled_tools", [])
+    return {name for name in names if isinstance(name, str)} if isinstance(names, list) else set()
+
+
+def _owns_endpoint(entry: Any) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    # Recognize legacy eager publication as well as entries from this version.
+    function = entry.get("schema", {}).get("function", {})
+    return entry.get("mcp_endpoint") is True or str(function.get("description", "")).startswith("[MCP:")
+
+
+def _publish_virtual_schemas(state: State, catalog: MCPCatalog) -> None:
+    """Publish only explicitly enabled virtual MCP endpoints onto ``state.tool_schemas``."""
+    for name, entry in list(state.tool_schemas.items()):
+        if _owns_endpoint(entry):
+            del state.tool_schemas[name]
+    vtools = catalog.virtual_tools
+    for name in sorted(_enabled_names(state) & vtools.keys()):
+        if name in state.tool_schemas:
+            log.warning("MCP endpoint %s conflicts with another tool; not published", name)
+            continue
+        state.tool_schemas[name] = {
+            "available": True,
+            "schema": vtools[name].schema,
+            "mcp_endpoint": True,
+        }
+
+
+class _MCPBaseTool(Tool):
+    """Base class for pure Sans-I/O MCP management tools."""
+
+    init = {"mcp_enabled_tools": list}
+    optional_reads = {"mcp_enabled_tools", "tool_schemas"}
+    writes = {"tool_schemas"}
+
+    def __init__(self, catalog: MCPCatalog | None = None) -> None:
+        super().__init__()
+        self.catalog = catalog if catalog is not None else MCPCatalog()
+
+    def _finish_ok(
+        self,
+        tc: ToolCall,
+        result: Any,
+        ts: float,
+        emit: EmitFn,
+    ) -> None:
+        text = "" if result is None else str(result)
+        tc.result = text
+        if text.startswith(("ERROR:", "MCP TOOL ERROR")):
+            tc.error = True
+        tc.finished_at = ts
+        tc._owner = None
+        emit(ToolCallFinished(tc))
+
+
+class MCPStatusTool(_MCPBaseTool):
+    """Summarize MCP server availability, protocol, discovered/enabled counts, and errors."""
+
+    name = "mcp_status"
+    description = (
+        "Summarize MCP server availability, protocol, discovered/enabled tool counts, "
+        "and actionable errors. Use search_mcp to find endpoint names."
+    )
     schema = {
         "type": "function",
         "function": {
-            "name": "mcp_virtual_tool_router",
-            "description": "Internal MCP virtual tool router; use mcp_status, mcp_refresh, or published mcp_* tools instead.",
+            "name": "mcp_status",
+            "description": description,
             "parameters": {"type": "object", "properties": {}},
         },
     }
 
-    init = {"mcp_enabled_tools": list}
-    optional_reads = {"mcp_enabled_tools"}
-    writes = {"mcp_enabled_tools", "tool_schemas"}
+    def call(self, state: State):
+        outcome = yield MCPStatusRequest(enabled=tuple(sorted(_enabled_names(state))))
+        if isinstance(outcome, MCPStatusResult):
+            self.catalog.update(outcome.catalog)
+            _publish_virtual_schemas(state, self.catalog)
+            return outcome.text
+        return str(outcome)
 
-    @staticmethod
-    def _enabled_names(state) -> set[str]:
-        names = getattr(state, "mcp_enabled_tools", [])
-        return {name for name in names if isinstance(name, str)} if isinstance(names, list) else set()
 
-    @staticmethod
-    def _owns_endpoint(entry: dict[str, Any]) -> bool:
-        # Recognize legacy eager publication as well as entries from this version.
-        function = entry.get("schema", {}).get("function", {})
-        return entry.get("mcp_endpoint") is True or str(function.get("description", "")).startswith("[MCP:")
+class MCPRefreshTool(_MCPBaseTool):
+    """Reload MCP config and schedule catalog discovery without enabling endpoints."""
 
-    def _enable_tools(self, state, names: Any) -> str:
-        if not isinstance(names, list) or any(not isinstance(name, str) or not name for name in names):
-            raise MCPError("tool must be a list of exact endpoint names from search_mcp")
-        catalog = self.registry.virtual_tools
-        unknown = sorted(set(names) - catalog.keys())
-        if unknown:
-            raise MCPError(f"Unknown MCP endpoint(s): {', '.join(unknown)}. Run search_mcp first. Nothing enabled.")
-        for name in names:
-            existing = state.tool_schemas.get(name)
-            if existing is not None and not self._owns_endpoint(existing):
-                raise MCPError(f"MCP endpoint {name!r} conflicts with another tool. Nothing enabled.")
-        state.mcp_enabled_tools = sorted(self._enabled_names(state) | set(names))
-        self._publish(state)
-        return _json_dump({"enabled": sorted(set(names)), "enabled_count": len(state.mcp_enabled_tools)})
-
-    def __init__(self, registry: MCPClientRegistry | None = None):
-        super().__init__()
-        self.registry = registry or MCPClientRegistry()
-
-    def _publish(self, state) -> None:
-        state.tool_schemas["mcp_status"] = {
-            "available": True,
-            "schema": {
-                "type": "function",
-                "function": {
-                    "name": "mcp_status",
-                    "description": "Summarize MCP server availability, protocol, discovered/enabled tool counts, and actionable errors. Use search_mcp to find endpoint names.",
-                    "parameters": {"type": "object", "properties": {}},
-                },
-            },
-        }
-        state.tool_schemas["mcp_refresh"] = {
-            "available": True,
-            "schema": {
-                "type": "function",
-                "function": {
-                    "name": "mcp_refresh",
-                    "description": "Reload MCP config and refresh the catalog without enabling endpoints. Returns immediately by default; use search_mcp then enable_mcp_tool to expose selected schemas.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "server": {
-                                "type": ["string", "null"],
-                                "description": "Optional configured MCP server name to refresh. Omit or null to refresh all servers.",
-                            },
-                            "wait_seconds": {
-                                "type": ["number", "null"],
-                                "description": "Optional small bounded wait for discovery to finish. Defaults to 0 (non-blocking) and is capped at 10 seconds.",
-                            }
-                        },
+    name = "mcp_refresh"
+    description = (
+        "Reload MCP config and refresh the catalog without enabling endpoints. "
+        "Returns immediately by default; use search_mcp then enable_mcp_tool to expose selected schemas."
+    )
+    schema = {
+        "type": "function",
+        "function": {
+            "name": "mcp_refresh",
+            "description": description,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "server": {
+                        "type": ["string", "null"],
+                        "description": "Optional configured MCP server name to refresh. Omit or null to refresh all servers.",
+                    },
+                    "wait_seconds": {
+                        "type": ["number", "null"],
+                        "description": "Optional small bounded wait for discovery to finish. Defaults to 0 (non-blocking) and is capped at 10 seconds.",
                     },
                 },
             },
-        }
+        },
+    }
 
-        state.tool_schemas["search_mcp"] = {
-            "available": True,
-            "schema": {"type": "function", "function": {
-                "name": "search_mcp",
-                "description": "Find configured MCP endpoints by names/descriptions without loading their schemas. Discovers missing catalogs with a bounded wait. Enable exact returned names with enable_mcp_tool before calling them.",
-                "parameters": {"type": "object", "properties": {
+    def call(
+        self,
+        state: State,
+        server: str | None = None,
+        wait_seconds: float | None = None,
+    ):
+        outcome = yield MCPRefreshRequest(
+            server=server or None,
+            force=True,
+            wait_seconds=float(wait_seconds or 0.0),
+        )
+        if isinstance(outcome, MCPRefreshResult):
+            self.catalog.update(outcome.catalog)
+            _publish_virtual_schemas(state, self.catalog)
+            return outcome.text
+        return str(outcome)
+
+
+class SearchMCPTool(_MCPBaseTool):
+    """Search configured MCP endpoints by names/descriptions without loading schemas."""
+
+    name = "search_mcp"
+    description = (
+        "Find configured MCP endpoints by names/descriptions without loading their schemas. "
+        "Discovers missing catalogs with a bounded wait. Enable exact returned names with enable_mcp_tool before calling them."
+    )
+    schema = {
+        "type": "function",
+        "function": {
+            "name": "search_mcp",
+            "description": description,
+            "parameters": {
+                "type": "object",
+                "properties": {
                     "query": {"type": "string", "description": "Case-insensitive words to match; empty lists the catalog."},
                     "server": {"type": ["string", "null"], "description": "Optional configured server name."},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 50, "description": "Results per page; default 20."},
-                    "offset": {"type": "integer", "minimum": 0, "description": "Page offset; default 0. Use the next offset shown when more matches are available."},
-                }},
-            }},
-        }
-        state.tool_schemas["enable_mcp_tool"] = {
-            "available": True,
-            "schema": {"type": "function", "function": {
-                "name": "enable_mcp_tool",
-                "description": "Enable selected MCP endpoints for this session and expose their full schemas. Pass exact names returned by search_mcp. Additive and idempotent; unknown names reject the entire batch. Does not execute endpoints.",
-                "parameters": {"type": "object", "properties": {
-                    "tool": {"type": "array", "items": {"type": "string"}, "description": "Exact endpoint names returned by search_mcp."},
-                }, "required": ["tool"]},
-            }},
-        }
-        try:
-            self.registry.sync_for_publish()
-        except Exception as exc:
-            log.warning("MCP publish sync failed: %s", exc)
-        for name, entry in list(state.tool_schemas.items()):
-            if self._owns_endpoint(entry):
-                del state.tool_schemas[name]
-        catalog = self.registry.virtual_tools
-        for name in sorted(self._enabled_names(state) & catalog.keys()):
-            if name in state.tool_schemas:
-                log.warning("MCP endpoint %s conflicts with another tool; not published", name)
-                continue
-            state.tool_schemas[name] = {
-                "available": True, "schema": catalog[name].schema, "mcp_endpoint": True,
-            }
+                    "offset": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Page offset; default 0. Use the next offset shown when more matches are available.",
+                    },
+                },
+            },
+        },
+    }
 
-    def transform(self, state):
-        for tc in getattr(state, "pending_tool_calls", []) or []:
-            if tc.result is not None:
-                continue
-            catalog = self.registry.virtual_tools
-            if tc.name not in {"mcp_status", "mcp_refresh", "search_mcp", "enable_mcp_tool"} and tc.name not in catalog:
-                continue
-            existing = state.tool_schemas.get(tc.name)
-            if tc.name in catalog and existing is not None and not self._owns_endpoint(existing):
-                continue  # Leave a colliding foreign tool call to its rightful handler.
-            try:
-                args = tc.parsed_args or {}
-                if tc.name == "mcp_status":
-                    tc.result = self.registry.status_text(enabled=self._enabled_names(state))
-                elif tc.name == "mcp_refresh":
-                    tc.result = self.registry.refresh(
-                        server=args.get("server") or None, force=True,
-                        wait_seconds=float(args.get("wait_seconds") or 0.0),
-                    )
-                elif tc.name == "search_mcp":
-                    result = self.registry.search_tools(**args)
-                    tc.result = _format_search_result(result, self._enabled_names(state))
-                elif tc.name == "enable_mcp_tool":
-                    tc.result = self._enable_tools(state, args.get("tool"))
-                elif tc.name not in self._enabled_names(state):
-                    raise MCPError(f"MCP endpoint {tc.name!r} is disabled. Use enable_mcp_tool(tool=[{tc.name!r}]) first.")
-                elif not self._owns_endpoint(state.tool_schemas.get(tc.name, {})):
-                    raise MCPError(f"MCP endpoint {tc.name!r} is not published; search and enable it again.")
-                else:
-                    tc.result = self.registry.call_virtual_tool(tc.name, args)
-                if tc.result.startswith(("ERROR:", "MCP TOOL ERROR")):
-                    tc.error = True
-            except Exception as exc:
-                tc.result = f"ERROR: {type(exc).__name__}: {exc}"
-                tc.error = True
-            self._notify(state, tc)
-            self._publish(state)
-        return state
+    def call(
+        self,
+        state: State,
+        query: Any = "",
+        server: Any = None,
+        limit: Any = 20,
+        offset: Any = 0,
+    ):
+        _validate_search_args(query=query, server=server, limit=limit, offset=offset)
+        outcome = yield MCPSearchRequest(
+            query=query,
+            server=server,
+            limit=limit,
+            offset=offset,
+        )
+        if isinstance(outcome, MCPSearchResult):
+            self.catalog.update(outcome.catalog)
+            _publish_virtual_schemas(state, self.catalog)
+            search_result = outcome.result
+        elif isinstance(outcome, dict):
+            search_result = outcome
+        else:
+            return str(outcome)
+        return _format_search_result(search_result, _enabled_names(state))
 
+
+class EnableMCPTool(_MCPBaseTool):
+    """Enable selected MCP endpoints for this session and expose their full schemas."""
+
+    name = "enable_mcp_tool"
+    description = (
+        "Enable selected MCP endpoints for this session and expose their full schemas. "
+        "Pass exact names returned by search_mcp. Additive and idempotent; unknown names reject the entire batch. "
+        "Does not execute endpoints."
+    )
+    schema = {
+        "type": "function",
+        "function": {
+            "name": "enable_mcp_tool",
+            "description": description,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tool": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Exact endpoint names returned by search_mcp.",
+                    },
+                },
+                "required": ["tool"],
+            },
+        },
+    }
+    writes = {"mcp_enabled_tools", "tool_schemas"}
+
+    def call(self, state: State, tool: Any = None) -> str:
+        if not isinstance(tool, list) or any(not isinstance(name, str) or not name for name in tool):
+            raise MCPError("tool must be a list of exact endpoint names from search_mcp")
+        vtools = self.catalog.virtual_tools
+        unknown = sorted(set(tool) - vtools.keys())
+        if unknown:
+            raise MCPError(f"Unknown MCP endpoint(s): {', '.join(unknown)}. Run search_mcp first. Nothing enabled.")
+        for name in tool:
+            existing = state.tool_schemas.get(name)
+            if existing is not None and not _owns_endpoint(existing):
+                raise MCPError(f"MCP endpoint {name!r} conflicts with another tool. Nothing enabled.")
+        state.mcp_enabled_tools = sorted(_enabled_names(state) | set(tool))
+        _publish_virtual_schemas(state, self.catalog)
+        return _json_dump({"enabled": sorted(set(tool)), "enabled_count": len(state.mcp_enabled_tools)})
+
+
+class MCPVirtualToolRouter:
+    """Pure Sans-I/O component routing virtual MCP endpoint calls via ``MCPCallToolRequest``.
+
+    Ordered after ``Tool`` and before ``UnknownToolFallback`` so real tools always
+    take precedence on any name collision.
+    """
+
+    handles = (RunToolCall, IoCompleted, IoFailed)
+    io_tag = "tool"
+    init = {"mcp_enabled_tools": list}
+    reads = {"pending_tool_calls"}
+    optional_reads = {"mcp_enabled_tools", "tool_schemas"}
+    writes = {"tool_schemas"}
+
+    def __init__(self, catalog: MCPCatalog | None = None) -> None:
+        self.catalog = catalog if catalog is not None else MCPCatalog()
+
+    def handle(self, event: Event, state: State, emit: EmitFn) -> None:
+        if isinstance(event, RunToolCall):
+            self._handle_run_tool_call(event, state, emit)
+        elif isinstance(event, (IoCompleted, IoFailed)):
+            self._handle_io_event(event, state, emit)
+
+    def _handle_run_tool_call(self, event: RunToolCall, state: State, emit: EmitFn) -> None:
+        tc = event.tool_call
+        if tc.result is not None:
+            return
+        vtools = self.catalog.virtual_tools
+        if tc.name not in vtools:
+            return
+        existing = state.tool_schemas.get(tc.name)
+        if existing is not None and not _owns_endpoint(existing):
+            return  # Leave a colliding foreign tool call to its rightful handler.
+
+        event.stop()
+        if tc.started_at is None:
+            tc.started_at = event.ts
+
+        enabled = _enabled_names(state)
+        if tc.name not in enabled:
+            self._finish_error(
+                tc,
+                MCPError(f"MCP endpoint {tc.name!r} is disabled. Use enable_mcp_tool(tool=[{tc.name!r}]) first."),
+                event.ts,
+                emit,
+            )
+            return
+        if not _owns_endpoint(state.tool_schemas.get(tc.name, {})):
+            self._finish_error(
+                tc,
+                MCPError(f"MCP endpoint {tc.name!r} is not published; search and enable it again."),
+                event.ts,
+                emit,
+            )
+            return
+
+        tc._owner = self
+        tc.waiting_op = state.io.submit(
+            MCPCallToolRequest(
+                virtual_name=tc.name,
+                arguments=dict(tc.parsed_args or {}),
+            ),
+            tag=self.io_tag,
+        )
+
+    def _handle_io_event(self, event: IoCompleted | IoFailed, state: State, emit: EmitFn) -> None:
+        tc = self._find_waiting_call(state, event.op_id)
+        if tc is None:
+            return
+        tc.waiting_op = None
+        tc._owner = None
+        if isinstance(event, IoCompleted):
+            val = event.value
+            if isinstance(val, MCPCallResult):
+                if val.catalog is not None:
+                    self.catalog.update(val.catalog)
+                    _publish_virtual_schemas(state, self.catalog)
+                text = val.text
+                is_error = bool(val.is_error or text.startswith(("ERROR:", "MCP TOOL ERROR")))
+            else:
+                text = "" if val is None else str(val)
+                is_error = text.startswith(("ERROR:", "MCP TOOL ERROR"))
+            tc.result = text
+            tc.error = is_error
+            tc.finished_at = event.ts
+            emit(ToolCallFinished(tc))
+        else:
+            err = event.error
+            exc = err if isinstance(err, BaseException) else RuntimeError(str(err))
+            self._finish_error(tc, exc, event.ts, emit)
+
+    def on_deadline(self, tc: ToolCall, state: State, emit: EmitFn) -> bool:
+        if tc.waiting_op is not None:
+            state.io.cancel(tc.waiting_op)
+            tc.waiting_op = None
+        tc.result = f"ERROR: Tool '{tc.name}' timed out (batch deadline exceeded)."
+        tc.error = True
+        tc._owner = None
+        return False
+
+    def _find_waiting_call(self, state: State, op_id: str) -> ToolCall | None:
+        pending = state.pending_tool_calls
+        cursor = state.tool_cursor
+        if 0 <= cursor < len(pending):
+            tc = pending[cursor]
+            if tc._owner is self and tc.waiting_op == op_id:
+                return tc
+        for tc in pending:
+            if tc._owner is self and tc.waiting_op == op_id:
+                return tc
+        return None
+
+    @staticmethod
+    def _finish_error(tc: ToolCall, exc: BaseException, ts: float, emit: EmitFn) -> None:
+        tc.result = f"ERROR: {type(exc).__name__}: {exc}"
+        tc.error = True
+        tc.finished_at = ts
+        tc._owner = None
+        emit(ToolCallFinished(tc))
+
+
+class MCPToolSchemaPublisher:
+    """Pure Sans-I/O component publishing enabled virtual MCP schemas after ``SchemaPublisher``.
+
+    Never performs network I/O or starts MCP servers. Also updates the in-memory
+    catalog on ``MCPCatalogUpdated`` events pushed by ``MCPClientDriver``.
+    """
+
+    handles = (RenderRequested, TurnSettled, MCPCatalogUpdated)
+    init = {"mcp_enabled_tools": list}
+    reads = {"tool_schemas"}
+    optional_reads = {"mcp_enabled_tools"}
+    writes = {"tool_schemas"}
+
+    def __init__(self, catalog: MCPCatalog | None = None) -> None:
+        self.catalog = catalog if catalog is not None else MCPCatalog()
+
+    def handle(self, event: Event, state: State, emit: EmitFn) -> None:
+        if isinstance(event, MCPCatalogUpdated):
+            self.catalog.update(event.catalog)
+        _publish_virtual_schemas(state, self.catalog)
+
+
+# ---------------------------------------------------------------------------
+# /config Settings
+# ---------------------------------------------------------------------------
 
 def _settings_document():
     """Read the authoritative path without the runtime loader's lenient fallback."""
@@ -1685,21 +2298,24 @@ def _settings_document():
             return path, {}
         if path.suffix.lower() in {".yaml", ".yml"}:
             import yaml
+
             document = yaml.safe_load(text)
         else:
             document = json.loads(_strip_json_line_comments(text))
         if not isinstance(document, dict):
             raise ValueError
         servers = document.get("mcpServers", document.get("servers", {}))
-        if servers is not None and (not isinstance(servers, dict)
-                                    or any(not isinstance(name, str) for name in servers)):
+        if servers is not None and (
+            not isinstance(servers, dict)
+            or any(not isinstance(name, str) for name in servers)
+        ):
             raise ValueError
         return path, document
     except Exception:
         raise SettingError("Cannot read MCP configuration; repair the file before editing.") from None
 
 
-def _server_setting(name, field, value=None):
+def _server_setting(name, field, value=None, ctx=None):
     path, document = _settings_document()
     servers = document.get("mcpServers", document.get("servers", {})) or {}
     entry = servers.get(name)
@@ -1716,8 +2332,11 @@ def _server_setting(name, field, value=None):
             return raw
         try:
             milliseconds = Decimal(str(raw)) * 1000
-            if (not milliseconds.is_finite() or milliseconds != milliseconds.to_integral_value()
-                    or not 1000 <= milliseconds <= 600000):
+            if (
+                not milliseconds.is_finite()
+                or milliseconds != milliseconds.to_integral_value()
+                or not 1000 <= milliseconds <= 600000
+            ):
                 raise ValueError
             return int(milliseconds)
         except (InvalidOperation, ValueError):
@@ -1734,6 +2353,7 @@ def _server_setting(name, field, value=None):
     try:
         if path.suffix.lower() in {".yaml", ".yml"}:
             import yaml
+
             text = yaml.safe_dump(document, sort_keys=False)
         else:
             text = json.dumps(document, ensure_ascii=False, indent=2) + "\n"
@@ -1743,8 +2363,13 @@ def _server_setting(name, field, value=None):
         path = path.resolve()  # Preserve existing symlinks by replacing their target.
         path.parent.mkdir(parents=True, exist_ok=True)
         mode = path.stat().st_mode & 0o7777 if path.exists() else 0o600
-        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
-                                         prefix=".mcp-settings-", delete=False) as stream:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=".mcp-settings-",
+            delete=False,
+        ) as stream:
             temporary = Path(stream.name)
             stream.write(text)
         temporary.chmod(mode)
@@ -1754,6 +2379,8 @@ def _server_setting(name, field, value=None):
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
+    if ctx is not None and callable(getattr(ctx, "submit_io", None)):
+        ctx.submit_io(MCPSyncCatalogRequest(force=True), tag="mcp_settings")
 
 
 def _mcp_settings():
@@ -1762,8 +2389,17 @@ def _mcp_settings():
     except SettingError:
         def unreadable(ctx):
             raise SettingError("Cannot read MCP configuration; repair the file and reload.")
-        return [Setting("mcp.configuration", "Configuration unavailable", "bool", unreadable,
-                        group="MCP", apply="reload")]
+
+        return [
+            Setting(
+                "mcp.configuration",
+                "Configuration unavailable",
+                "bool",
+                unreadable,
+                group="MCP",
+                apply="reload",
+            )
+        ]
     settings = []
     servers = document.get("mcpServers", document.get("servers", {})) or {}
     for name, entry in servers.items():
@@ -1776,21 +2412,86 @@ def _mcp_settings():
             ("timeout_seconds", "Timeout (ms)", "int", {"min": 1000, "max": 600000}),
         ):
             setting_key = "timeout_ms" if field == "timeout_seconds" else field
-            settings.append(Setting(
-                f"{prefix}.{setting_key}", f"{_clean_token(name)[:100]}: {label}", kind,
-                get=lambda ctx, n=name, f=field: _server_setting(n, f),
-                set=lambda ctx, value, n=name, f=field: _server_setting(n, f, value),
-                group="MCP", apply="live",
-                help="Configured value; applied on the next MCP configuration poll/operation. "
-                     "Adding or removing servers requires reloading the settings catalog.",
-                **bounds,
-            ))
+            settings.append(
+                Setting(
+                    f"{prefix}.{setting_key}",
+                    f"{_clean_token(name)[:100]}: {label}",
+                    kind,
+                    get=lambda ctx, n=name, f=field: _server_setting(n, f),
+                    set=lambda ctx, value, n=name, f=field: _server_setting(n, f, value, ctx=ctx),
+                    group="MCP",
+                    apply="live",
+                    help=(
+                        "Configured value; applied on the next MCP configuration poll/operation. "
+                        "Adding or removing servers requires reloading the settings catalog."
+                    ),
+                    **bounds,
+                )
+            )
     return settings
 
 
-def register_features(builder, *, session, config):
-    builder.add(Feature(name="mcp_settings", components=_mcp_settings(), order=[Setting]))
-    builder.add(Feature(
+# ---------------------------------------------------------------------------
+# Feature Composition & Plugin Entry Point
+# ---------------------------------------------------------------------------
+
+def mcp_client_feature(
+    *,
+    catalog: MCPCatalog | None = None,
+    registry: MCPClientRegistry | None = None,
+    include_driver: bool = True,
+) -> Feature:
+    """Create the Sans-I/O MCP client ``Feature`` and optional ``MCPClientDriver``."""
+    shared_catalog = catalog if catalog is not None else MCPCatalog()
+    drivers: list[Any] = []
+    if include_driver:
+        if registry is not None:
+            drivers.append(lambda _cfg=None, _reg=registry: MCPClientDriver(registry=_reg))
+        else:
+            drivers.append(lambda _cfg=None: MCPClientDriver())
+    return Feature(
         name="mcp_client_addon",
-        components=[MCPVirtualToolRouter()],
-    ))
+        components=[
+            MCPStatusTool(shared_catalog),
+            MCPRefreshTool(shared_catalog),
+            SearchMCPTool(shared_catalog),
+            EnableMCPTool(shared_catalog),
+            MCPVirtualToolRouter(shared_catalog),
+            MCPToolSchemaPublisher(shared_catalog),
+        ],
+        order=[
+            Tool,
+            MCPVirtualToolRouter,
+            UnknownToolFallback,
+            SchemaPublisher,
+            MCPToolSchemaPublisher,
+        ],
+        drivers=drivers,
+    )
+
+
+def register_features(builder, *, session, config):
+    """Register MCP settings and Sans-I/O MCP client + driver features."""
+    shared_catalog = MCPCatalog()
+    builder.add(Feature(name="mcp_settings", components=_mcp_settings(), order=[Setting]))
+    builder.add(
+        Feature(
+            name="mcp_client_addon",
+            components=[
+                MCPStatusTool(shared_catalog),
+                MCPRefreshTool(shared_catalog),
+                SearchMCPTool(shared_catalog),
+                EnableMCPTool(shared_catalog),
+                MCPVirtualToolRouter(shared_catalog),
+                MCPToolSchemaPublisher(shared_catalog),
+            ],
+            order=[
+                Tool,
+                MCPVirtualToolRouter,
+                UnknownToolFallback,
+                SchemaPublisher,
+                MCPToolSchemaPublisher,
+            ],
+            drivers=[lambda _cfg=None: MCPClientDriver()],
+        )
+    )
