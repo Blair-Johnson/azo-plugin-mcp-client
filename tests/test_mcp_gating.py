@@ -8,7 +8,14 @@ from pathlib import Path
 import unittest
 from unittest.mock import Mock, patch
 
-from agent_utils.core.events import InputReceived, RenderRequested, RunToolCall, TurnSettled
+from agent_utils.core.events import (
+    InputReceived,
+    IoInterrupted,
+    RenderRequested,
+    RunToolCall,
+    SessionRestored,
+    TurnSettled,
+)
 from agent_utils.core.pipeline import Feature, PipelineBuilder
 from agent_utils.core.session import Session
 from agent_utils.core.state import State, ToolCall
@@ -17,6 +24,7 @@ from agent_utils.features.core import core_feature
 from agent_utils.runtime.loop import Runtime
 from agent_utils.runtime.simulation import SimulationRuntime
 from agent_utils.storage.serialization import capture_session_document, restore_session_document
+from agent_zoo.testing.sans_io_guard import assert_pipeline_sans_io, audit_module_sans_io
 
 SPEC = importlib.util.spec_from_file_location(
     "gating_mcp_client", Path(__file__).resolve().parents[1] / "src/mcp_client.py"
@@ -127,6 +135,10 @@ class GatingTests(unittest.TestCase):
     def _call(self, name: str, **args) -> ToolCall:
         return run_tool_call(self.session, self.driver, name, **args)
 
+    def _enabled(self, session: Session | None = None) -> list[str]:
+        target = session if session is not None else self.session
+        return target.state.durable("mcp_client", mcp.MCPClientState).enabled_tools
+
     def test_default_is_only_management_tools(self):
         self.session.render()
         self.assertEqual(
@@ -140,7 +152,7 @@ class GatingTests(unittest.TestCase):
         self.assertFalse(result.error, result.result)
         self.assertEqual(result.result, "mcp_rea_inspect — Inspect an artifact")
         self.assertNotIn("SCHEMA_SENTINEL", result.result)
-        self.assertEqual(self.session.state.mcp_enabled_tools, [])
+        self.assertEqual(self._enabled(), [])
         self.registry._schedule_discovery.assert_not_called()
 
     def test_search_text_only_adds_relevant_notices(self):
@@ -220,26 +232,26 @@ class GatingTests(unittest.TestCase):
             with self.subTest(args=args):
                 result = self._call("search_mcp", **args)
                 self.assertTrue(result.error)
-        self.assertEqual(self.session.state.mcp_enabled_tools, [])
+        self.assertEqual(self._enabled(), [])
 
     def test_enable_is_additive_idempotent_and_schema_exact(self):
         result = self._call("enable_mcp_tool", tool=["mcp_rea_inspect"])
         self.assertFalse(result.error, result.result)
-        self.assertEqual(self.session.state.mcp_enabled_tools, ["mcp_rea_inspect"])
+        self.assertEqual(self._enabled(), ["mcp_rea_inspect"])
         self.assertEqual(
             self.session.state.tool_schemas["mcp_rea_inspect"]["schema"],
             self.registry.virtual_tools["mcp_rea_inspect"].schema,
         )
         self.assertNotIn("mcp_rea_analyze", self.session.state.tool_schemas)
         self._call("enable_mcp_tool", tool=["mcp_rea_inspect", "mcp_rea_inspect", "mcp_rea_analyze"])
-        self.assertEqual(self.session.state.mcp_enabled_tools, ["mcp_rea_analyze", "mcp_rea_inspect"])
+        self.assertEqual(self._enabled(), ["mcp_rea_analyze", "mcp_rea_inspect"])
         result = self._call("search_mcp", query="inspect", server="rea")
         self.assertEqual(result.result, "mcp_rea_inspect [enabled] — Inspect an artifact")
 
     def test_unknown_batch_is_atomic(self):
         result = self._call("enable_mcp_tool", tool=["mcp_rea_inspect", "typo"])
         self.assertTrue(result.error)
-        self.assertEqual(self.session.state.mcp_enabled_tools, [])
+        self.assertEqual(self._enabled(), [])
         self.assertNotIn("mcp_rea_inspect", self.session.state.tool_schemas)
 
     def test_invalid_enable_arguments_and_empty_noop(self):
@@ -247,7 +259,7 @@ class GatingTests(unittest.TestCase):
             with self.subTest(names=names):
                 self.assertTrue(self._call("enable_mcp_tool", tool=names).error)
         self.assertFalse(self._call("enable_mcp_tool", tool=[]).error)
-        self.assertEqual(self.session.state.mcp_enabled_tools, [])
+        self.assertEqual(self._enabled(), [])
 
     def test_direct_disabled_call_does_not_execute(self):
         result = self._call("mcp_rea_inspect", path="example")
@@ -269,12 +281,12 @@ class GatingTests(unittest.TestCase):
         second, _, _ = build_mcp_session(self.registry, catalog=self.catalog)
         second.render()
         self.assertNotIn("mcp_rea_inspect", second.state.tool_schemas)
-        self.assertEqual(second.state.mcp_enabled_tools, [])
+        self.assertEqual(self._enabled(second), [])
 
     def test_legacy_eager_schemas_removed_without_enabling(self):
         publisher = mcp.MCPToolSchemaPublisher(self.catalog)
         state = State()
-        state.mcp_enabled_tools = []
+        state.durable(mcp.MCP_CLIENT_DURABLE_SPEC).enabled_tools = []
         state.tool_schemas = {
             name: {"schema": item.schema, "available": True}
             for name, item in self.registry.virtual_tools.items()
@@ -283,7 +295,7 @@ class GatingTests(unittest.TestCase):
         publisher.handle(RenderRequested(), state, lambda _ev: None)
         self.assertNotIn("mcp_rea_inspect", state.tool_schemas)
         self.assertIn("unrelated", state.tool_schemas)
-        self.assertEqual(state.mcp_enabled_tools, [])
+        self.assertEqual(state.durable("mcp_client", mcp.MCPClientState).enabled_tools, [])
 
     def test_refresh_never_enables_new_tools_and_removes_old_schemas(self):
         self._call("enable_mcp_tool", tool=["mcp_rea_inspect"])
@@ -312,7 +324,7 @@ class GatingTests(unittest.TestCase):
         entry = session.state.tool_schemas["mcp_rea_inspect"]
         result = run_tool_call(session, driver, "enable_mcp_tool", tool=["mcp_rea_inspect"])
         self.assertTrue(result.error)
-        self.assertEqual(session.state.mcp_enabled_tools, [])
+        self.assertEqual(self._enabled(session), [])
         self.assertEqual(session.state.tool_schemas["mcp_rea_inspect"], entry)
 
     def test_control_names_cannot_be_shadowed(self):
@@ -365,7 +377,7 @@ class GatingTests(unittest.TestCase):
             extra_features=[Feature(name="foreign_plugin", components=[ForeignTool()])],
         )
         for selected in ([], ["mcp_rea_inspect"]):
-            session.state.mcp_enabled_tools = list(selected)
+            session.state.durable("mcp_client", mcp.MCPClientState).enabled_tools = list(selected)
             result = run_tool_call(session, driver, "mcp_rea_inspect", path="example")
             self.assertFalse(result.error)
             self.assertEqual(result.result, "foreign:example")
@@ -378,7 +390,7 @@ class GatingTests(unittest.TestCase):
             "schema": {"function": {"name": "mcp_rea_inspect", "description": "Another plugin"}},
             "available": True,
         }
-        raw_state.mcp_enabled_tools = ["mcp_rea_inspect"]
+        raw_state.durable("mcp_client", mcp.MCPClientState).enabled_tools = ["mcp_rea_inspect"]
         tc = ToolCall(id="c1", name="mcp_rea_inspect", raw_args="{}", parsed_args={"path": "x"})
         emitted = []
         router.handle(RunToolCall(tc), raw_state, emitted.append)
@@ -405,8 +417,9 @@ class GatingTests(unittest.TestCase):
         restored_catalog = mcp.MCPCatalog()
         restored, _, _ = build_mcp_session(catalog=restored_catalog)
         restore_session_document(document, restored.pipeline, state=restored.state)
+        restored.step(SessionRestored())
         restored.render()
-        self.assertEqual(restored.state.mcp_enabled_tools, ["mcp_rea_inspect"])
+        self.assertEqual(self._enabled(restored), ["mcp_rea_inspect"])
         self.assertNotIn("mcp_rea_inspect", restored.state.tool_schemas)
         self.assertEqual(len(restored.tool_schemas), 4)
 
@@ -415,6 +428,78 @@ class GatingTests(unittest.TestCase):
         self.assertIn("mcp_rea_inspect", restored.state.tool_schemas)
         self.assertNotIn("mcp_rea_analyze", restored.state.tool_schemas)
         self.assertEqual(len(restored.tool_schemas), 5)
+
+    def test_driver_quiesce_and_router_io_interrupted_and_sans_io_guard(self):
+        import threading
+
+        # Verify explicit durability and Sans-I/O cleanliness.
+        self.assertEqual(mcp.MCPClientDriver.durability, "process_bound")
+        self.assertEqual(
+            audit_module_sans_io(Path(__file__).resolve().parents[1] / "src/mcp_client.py"),
+            [],
+        )
+        assert_pipeline_sans_io(
+            self.session.pipeline,
+            session=self.session,
+            events=[RenderRequested(), SessionRestored(), TurnSettled()],
+        )
+
+        # Verify quiesce cancels in-flight tool calls and emits IoInterrupted.
+        entered = threading.Event()
+        release = threading.Event()
+
+        def slow_call(tool_name, args):
+            entered.set()
+            release.wait(2.0)
+            return {"content": [{"type": "text", "text": "late"}]}
+
+        self.registry._clients["rea"].call_tool.side_effect = slow_call
+        self._call("enable_mcp_tool", tool=["mcp_rea_inspect"])
+        drv = mcp.MCPClientDriver(registry=self.registry)
+        emitted = []
+        drv.start(emitted.append)
+        try:
+            effects = self.session.step(InputReceived(message={
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "tc_int",
+                    "type": "function",
+                    "function": {"name": "mcp_rea_inspect", "arguments": "{}"},
+                }],
+            }))
+            submit_eff = next(e for e in effects if isinstance(getattr(e, "request", None), mcp.MCPCallToolRequest))
+            drv.submit(submit_eff.op_id, submit_eff.request)
+            self.assertTrue(entered.wait(1.0))
+            interrupted = drv.quiesce(policy="terminate")
+            self.assertEqual(len(interrupted), 1)
+            self.assertIsInstance(interrupted[0], IoInterrupted)
+            self.assertEqual(interrupted[0].op_id, submit_eff.op_id)
+            self.session.step(interrupted[0])
+            tc = self.session.state.last_tool_calls[-1]
+            self.assertTrue(tc.error)
+            self.assertIn("interrupted", tc.result.lower())
+            self.assertIsNone(tc.waiting_op)
+            self.assertIsNone(tc._owner)
+
+            # Also verify MCPVirtualToolRouter handles IoInterrupted directly.
+            router = mcp.MCPVirtualToolRouter(self.catalog)
+            raw_state = State()
+            tc2 = ToolCall(id="tc_int2", name="mcp_rea_inspect", raw_args="{}", parsed_args={})
+            tc2._owner = router
+            tc2.waiting_op = "op_direct"
+            raw_state.pending_tool_calls = [tc2]
+            direct_emitted = []
+            router.handle(IoInterrupted(op_id="op_direct", reason="quiesce:terminate"), raw_state, direct_emitted.append)
+            self.assertTrue(tc2.error)
+            self.assertIn("interrupted", tc2.result.lower())
+            self.assertIsNone(tc2.waiting_op)
+            self.assertIsNone(tc2._owner)
+            self.assertEqual(len(direct_emitted), 1)
+        finally:
+            release.set()
+            drv.close()
+        self.assertTrue(self.registry._closed)
 
     def test_pure_simulation_and_driver_unsolicited_catalog_update(self):
         # Pure Sans-I/O test with SimulationRuntime: zero real registry or threads.

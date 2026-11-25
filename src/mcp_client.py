@@ -42,10 +42,10 @@ runtime. YAML configs are supported opportunistically when PyYAML is already
 installed by agent-zoo, but JSON configs require no optional imports.
 """
 
-import atexit
 from collections import deque
 from collections.abc import Callable, Iterable
 from concurrent.futures import Future, ThreadPoolExecutor
+import copy
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 import hashlib
@@ -56,7 +56,6 @@ from pathlib import Path
 import re
 import shlex
 import subprocess
-import tempfile
 import threading
 import time
 from typing import Any
@@ -65,18 +64,22 @@ from agent_utils.core.events import (
     Event,
     IoCompleted,
     IoFailed,
+    IoInterrupted,
     RenderRequested,
     RunToolCall,
+    SessionRestored,
     ToolCallFinished,
     TurnSettled,
 )
 from agent_utils.core.io import IoRequest, OpId
 from agent_utils.core.pipeline import EmitFn, Feature
-from agent_utils.core.state import State, ToolCall
+from agent_utils.core.state import DurableSpec, State, ToolCall
 from agent_utils.core.tool import Tool
 from agent_utils.features.core import SchemaPublisher, UnknownToolFallback
 from agent_utils.runtime.driver import Driver
+from agent_zoo.durability import PluginStorage, StoreUpdate
 from agent_zoo.features.settings import Setting, SettingError
+from agent_zoo.storage.projects import resolve_state_root
 
 log = logging.getLogger("agent_zoo_user_plugin.mcp_client")
 
@@ -256,15 +259,11 @@ def _shorten_tool_name(name: str) -> str:
 
 
 def _agent_zoo_data_root() -> Path:
-    for env_name in ("AGENT_ZOO_HOME", "AGENT_ZOO_STATE_ROOT"):
-        env_path = os.environ.get(env_name, "").strip()
-        if env_path:
-            return Path(env_path).expanduser()
-    return Path.home() / ".local" / "share" / "agent-zoo"
+    return resolve_state_root()
 
 
 def _user_config_dir() -> Path:
-    return _agent_zoo_data_root() / "plugin-configs" / _PLUGIN_NAME
+    return PluginStorage(_PLUGIN_NAME).config_dir
 
 
 def _default_config_path() -> Path:
@@ -1193,7 +1192,7 @@ class MCPClientRegistry:
         self._discovery_started_at: dict[str, float] = {}
         self._discovery_status: dict[str, str] = {}
         self._on_catalog_change = on_catalog_change
-        atexit.register(self.close_all)
+        self._closed = False
 
     @staticmethod
     def _make_client(config: MCPServerConfig) -> StdioMCPClient:
@@ -1216,8 +1215,20 @@ class MCPClientRegistry:
 
     def close_all(self) -> None:
         with self._lock:
+            self._closed = True
             clients = list(self._clients.values())
+            threads = list(self._discovery_threads.values())
         for client in clients:
+            client.close()
+        current = threading.current_thread()
+        for thread in threads:
+            if thread is not current and thread.is_alive():
+                thread.join(timeout=2.0)
+        with self._lock:
+            remaining = [c for c in self._clients.values() if c not in clients]
+            self._clients.clear()
+            self._discovery_threads.clear()
+        for client in remaining:
             client.close()
 
     def refresh(
@@ -1307,6 +1318,8 @@ class MCPClientRegistry:
         now = time.monotonic()
         catalog_snapshot: dict[str, MCPVirtualTool] | None = None
         with self._lock:
+            if self._closed:
+                return
             cfg = self._servers.get(name)
             if cfg is None or not cfg.enabled:
                 had_virtuals = bool(self._server_virtuals.get(name))
@@ -1350,6 +1363,10 @@ class MCPClientRegistry:
     def _discover_server(self, name: str, force: bool = False) -> None:
         now = time.monotonic()
         with self._lock:
+            if self._closed:
+                if self._discovery_threads.get(name) is threading.current_thread():
+                    self._discovery_threads.pop(name, None)
+                return
             cfg = self._servers.get(name)
             if cfg is None or not cfg.enabled:
                 self._discovery_status[name] = "disabled"
@@ -1367,7 +1384,7 @@ class MCPClientRegistry:
             tools = client.list_tools()
         except Exception as exc:
             with self._lock:
-                if self._clients.get(name) is not client or self._servers.get(name) != cfg:
+                if self._closed or self._clients.get(name) is not client or self._servers.get(name) != cfg:
                     if self._discovery_threads.get(name) is threading.current_thread():
                         self._discovery_threads.pop(name, None)
                     return
@@ -1381,7 +1398,7 @@ class MCPClientRegistry:
             return
         catalog_snapshot: dict[str, MCPVirtualTool] | None = None
         with self._lock:
-            if self._clients.get(name) is not client or self._servers.get(name) != cfg:
+            if self._closed or self._clients.get(name) is not client or self._servers.get(name) != cfg:
                 if self._discovery_threads.get(name) is threading.current_thread():
                     self._discovery_threads.pop(name, None)
                 return
@@ -1505,6 +1522,8 @@ class MCPClientRegistry:
 
     def call_virtual_tool(self, virtual_name: str, arguments: dict[str, Any]) -> str:
         with self._lock:
+            if self._closed:
+                return "ERROR: MCP client registry is closed."
             mapping = self._virtual_tools.get(virtual_name)
             if mapping is None:
                 return f"ERROR: unknown MCP virtual tool {virtual_name!r}. Run mcp_refresh and mcp_status."
@@ -1770,6 +1789,28 @@ class MCPCatalog:
         return name in self._virtual_tools
 
 
+@dataclass
+class MCPClientState:
+    """Durable per-session MCP virtual tool selection."""
+
+    enabled_tools: list[str] = field(default_factory=list)
+
+
+MCP_CLIENT_DURABLE_SPEC = DurableSpec(
+    name="mcp_client",
+    cls=MCPClientState,
+    version=1,
+    on_fork="copy",
+)
+
+
+@dataclass
+class MCPClientRuntime:
+    """Strictly ephemeral per-session MCP runtime catalog reference (never serialized)."""
+
+    catalog: MCPCatalog = field(default_factory=MCPCatalog)
+
+
 # ---------------------------------------------------------------------------
 # Runtime Driver (imperative IO shell)
 # ---------------------------------------------------------------------------
@@ -1777,6 +1818,7 @@ class MCPCatalog:
 class MCPClientDriver(Driver):
     """Runtime IO driver owning ``MCPClientRegistry`` and executing ``MCPRequest``s."""
 
+    durability = "process_bound"
     request_types = (MCPRequest,)
 
     def __init__(
@@ -1791,6 +1833,7 @@ class MCPClientDriver(Driver):
         self._lock = threading.Lock()
         self._executor: ThreadPoolExecutor | None = None
         self._futures: dict[OpId, Future[Any]] = {}
+        self._in_flight: dict[OpId, MCPRequest] = {}
         self._cancelled: set[OpId] = set()
         self._closed = False
 
@@ -1827,13 +1870,37 @@ class MCPClientDriver(Driver):
                 )
             fut = self._executor.submit(self._execute, op_id, req)
             self._futures[op_id] = fut
+            self._in_flight[op_id] = req
 
     def cancel(self, op_id: OpId) -> None:
         with self._lock:
             self._cancelled.add(op_id)
             fut = self._futures.get(op_id)
+            self._in_flight.pop(op_id, None)
         if fut is not None:
             fut.cancel()
+
+    def quiesce(
+        self,
+        *,
+        policy: str = "terminate",
+        deadline: float | None = None,
+    ) -> list[Event]:
+        del deadline
+        with self._lock:
+            in_flight = list(self._in_flight.items())
+            futures = list(self._futures.values())
+            for op_id, _req in in_flight:
+                self._cancelled.add(op_id)
+            self._in_flight.clear()
+            self._futures.clear()
+        for fut in futures:
+            fut.cancel()
+        reason = f"quiesce:{policy}"
+        return [
+            IoInterrupted(op_id=op_id, reason=reason)
+            for op_id, _req in in_flight
+        ]
 
     def close(self) -> None:
         with self._lock:
@@ -1841,6 +1908,7 @@ class MCPClientDriver(Driver):
             futures = list(self._futures.values())
             self._cancelled.update(self._futures.keys())
             self._futures.clear()
+            self._in_flight.clear()
             executor = self._executor
             self._executor = None
         self.registry._on_catalog_change = None
@@ -1872,6 +1940,7 @@ class MCPClientDriver(Driver):
         finally:
             with self._lock:
                 self._futures.pop(op_id, None)
+                self._in_flight.pop(op_id, None)
                 self._cancelled.discard(op_id)
 
     def _dispatch_request(self, req: MCPRequest) -> Any:
@@ -1911,9 +1980,26 @@ class MCPClientDriver(Driver):
 # Pure Sans-I/O Pipeline Tools & Event Components
 # ---------------------------------------------------------------------------
 
+def _mcp_state(state: State) -> MCPClientState:
+    return state.durable(MCP_CLIENT_DURABLE_SPEC)
+
+
 def _enabled_names(state: State) -> set[str]:
-    names = getattr(state, "mcp_enabled_tools", [])
+    names = _mcp_state(state).enabled_tools
     return {name for name in names if isinstance(name, str)} if isinstance(names, list) else set()
+
+
+def _session_catalog(state: State, shared: MCPCatalog) -> MCPCatalog:
+    rt = state.runtime("mcp_client", lambda: MCPClientRuntime(catalog=shared))
+    return rt.catalog
+
+
+def _update_catalog(state: State, shared: MCPCatalog, tools: dict[str, MCPVirtualTool]) -> MCPCatalog:
+    shared.update(tools)
+    cat = _session_catalog(state, shared)
+    if cat is not shared:
+        cat.update(tools)
+    return cat
 
 
 def _owns_endpoint(entry: Any) -> bool:
@@ -1944,8 +2030,7 @@ def _publish_virtual_schemas(state: State, catalog: MCPCatalog) -> None:
 class _MCPBaseTool(Tool):
     """Base class for pure Sans-I/O MCP management tools."""
 
-    init = {"mcp_enabled_tools": list}
-    optional_reads = {"mcp_enabled_tools", "tool_schemas"}
+    optional_reads = {"tool_schemas"}
     writes = {"tool_schemas"}
 
     def __init__(self, catalog: MCPCatalog | None = None) -> None:
@@ -1988,8 +2073,8 @@ class MCPStatusTool(_MCPBaseTool):
     def call(self, state: State):
         outcome = yield MCPStatusRequest(enabled=tuple(sorted(_enabled_names(state))))
         if isinstance(outcome, MCPStatusResult):
-            self.catalog.update(outcome.catalog)
-            _publish_virtual_schemas(state, self.catalog)
+            cat = _update_catalog(state, self.catalog, outcome.catalog)
+            _publish_virtual_schemas(state, cat)
             return outcome.text
         return str(outcome)
 
@@ -2035,8 +2120,8 @@ class MCPRefreshTool(_MCPBaseTool):
             wait_seconds=float(wait_seconds or 0.0),
         )
         if isinstance(outcome, MCPRefreshResult):
-            self.catalog.update(outcome.catalog)
-            _publish_virtual_schemas(state, self.catalog)
+            cat = _update_catalog(state, self.catalog, outcome.catalog)
+            _publish_virtual_schemas(state, cat)
             return outcome.text
         return str(outcome)
 
@@ -2086,8 +2171,8 @@ class SearchMCPTool(_MCPBaseTool):
             offset=offset,
         )
         if isinstance(outcome, MCPSearchResult):
-            self.catalog.update(outcome.catalog)
-            _publish_virtual_schemas(state, self.catalog)
+            cat = _update_catalog(state, self.catalog, outcome.catalog)
+            _publish_virtual_schemas(state, cat)
             search_result = outcome.result
         elif isinstance(outcome, dict):
             search_result = outcome
@@ -2123,12 +2208,13 @@ class EnableMCPTool(_MCPBaseTool):
             },
         },
     }
-    writes = {"mcp_enabled_tools", "tool_schemas"}
+    writes = {"tool_schemas"}
 
     def call(self, state: State, tool: Any = None) -> str:
         if not isinstance(tool, list) or any(not isinstance(name, str) or not name for name in tool):
             raise MCPError("tool must be a list of exact endpoint names from search_mcp")
-        vtools = self.catalog.virtual_tools
+        cat = _session_catalog(state, self.catalog)
+        vtools = cat.virtual_tools
         unknown = sorted(set(tool) - vtools.keys())
         if unknown:
             raise MCPError(f"Unknown MCP endpoint(s): {', '.join(unknown)}. Run search_mcp first. Nothing enabled.")
@@ -2136,9 +2222,10 @@ class EnableMCPTool(_MCPBaseTool):
             existing = state.tool_schemas.get(name)
             if existing is not None and not _owns_endpoint(existing):
                 raise MCPError(f"MCP endpoint {name!r} conflicts with another tool. Nothing enabled.")
-        state.mcp_enabled_tools = sorted(_enabled_names(state) | set(tool))
-        _publish_virtual_schemas(state, self.catalog)
-        return _json_dump({"enabled": sorted(set(tool)), "enabled_count": len(state.mcp_enabled_tools)})
+        mcp_st = _mcp_state(state)
+        mcp_st.enabled_tools = sorted(_enabled_names(state) | set(tool))
+        _publish_virtual_schemas(state, cat)
+        return _json_dump({"enabled": sorted(set(tool)), "enabled_count": len(mcp_st.enabled_tools)})
 
 
 class MCPVirtualToolRouter:
@@ -2148,11 +2235,10 @@ class MCPVirtualToolRouter:
     take precedence on any name collision.
     """
 
-    handles = (RunToolCall, IoCompleted, IoFailed)
+    handles = (RunToolCall, IoCompleted, IoFailed, IoInterrupted)
     io_tag = "tool"
-    init = {"mcp_enabled_tools": list}
     reads = {"pending_tool_calls"}
-    optional_reads = {"mcp_enabled_tools", "tool_schemas"}
+    optional_reads = {"tool_schemas"}
     writes = {"tool_schemas"}
 
     def __init__(self, catalog: MCPCatalog | None = None) -> None:
@@ -2161,14 +2247,14 @@ class MCPVirtualToolRouter:
     def handle(self, event: Event, state: State, emit: EmitFn) -> None:
         if isinstance(event, RunToolCall):
             self._handle_run_tool_call(event, state, emit)
-        elif isinstance(event, (IoCompleted, IoFailed)):
+        elif isinstance(event, (IoCompleted, IoFailed, IoInterrupted)):
             self._handle_io_event(event, state, emit)
 
     def _handle_run_tool_call(self, event: RunToolCall, state: State, emit: EmitFn) -> None:
         tc = event.tool_call
         if tc.result is not None:
             return
-        vtools = self.catalog.virtual_tools
+        vtools = _session_catalog(state, self.catalog).virtual_tools
         if tc.name not in vtools:
             return
         existing = state.tool_schemas.get(tc.name)
@@ -2206,7 +2292,12 @@ class MCPVirtualToolRouter:
             tag=self.io_tag,
         )
 
-    def _handle_io_event(self, event: IoCompleted | IoFailed, state: State, emit: EmitFn) -> None:
+    def _handle_io_event(
+        self,
+        event: IoCompleted | IoFailed | IoInterrupted,
+        state: State,
+        emit: EmitFn,
+    ) -> None:
         tc = self._find_waiting_call(state, event.op_id)
         if tc is None:
             return
@@ -2216,8 +2307,8 @@ class MCPVirtualToolRouter:
             val = event.value
             if isinstance(val, MCPCallResult):
                 if val.catalog is not None:
-                    self.catalog.update(val.catalog)
-                    _publish_virtual_schemas(state, self.catalog)
+                    cat = _update_catalog(state, self.catalog, val.catalog)
+                    _publish_virtual_schemas(state, cat)
                 text = val.text
                 is_error = bool(val.is_error or text.startswith(("ERROR:", "MCP TOOL ERROR")))
             else:
@@ -2225,6 +2316,12 @@ class MCPVirtualToolRouter:
                 is_error = text.startswith(("ERROR:", "MCP TOOL ERROR"))
             tc.result = text
             tc.error = is_error
+            tc.finished_at = event.ts
+            emit(ToolCallFinished(tc))
+        elif isinstance(event, IoInterrupted):
+            reason = str(event.reason or "interrupted")
+            tc.result = f"INTERRUPTED: MCP tool '{tc.name}' was interrupted ({reason})."
+            tc.error = True
             tc.finished_at = event.ts
             emit(ToolCallFinished(tc))
         else:
@@ -2266,67 +2363,66 @@ class MCPToolSchemaPublisher:
     """Pure Sans-I/O component publishing enabled virtual MCP schemas after ``SchemaPublisher``.
 
     Never performs network I/O or starts MCP servers. Also updates the in-memory
-    catalog on ``MCPCatalogUpdated`` events pushed by ``MCPClientDriver``.
+    catalog on ``MCPCatalogUpdated`` events pushed by ``MCPClientDriver`` and
+    re-syncs on ``SessionRestored``.
     """
 
-    handles = (RenderRequested, TurnSettled, MCPCatalogUpdated)
-    init = {"mcp_enabled_tools": list}
+    handles = (RenderRequested, TurnSettled, MCPCatalogUpdated, SessionRestored)
     reads = {"tool_schemas"}
-    optional_reads = {"mcp_enabled_tools"}
     writes = {"tool_schemas"}
 
     def __init__(self, catalog: MCPCatalog | None = None) -> None:
         self.catalog = catalog if catalog is not None else MCPCatalog()
 
     def handle(self, event: Event, state: State, emit: EmitFn) -> None:
+        del emit
         if isinstance(event, MCPCatalogUpdated):
-            self.catalog.update(event.catalog)
-        _publish_virtual_schemas(state, self.catalog)
-
-
-# ---------------------------------------------------------------------------
-# /config Settings
-# ---------------------------------------------------------------------------
-
-def _settings_document():
-    """Read the authoritative path without the runtime loader's lenient fallback."""
-    try:
-        path = _default_config_path()
-        try:
-            text = path.read_text(encoding="utf-8")
-        except FileNotFoundError:
-            return path, {}
-        if path.suffix.lower() in {".yaml", ".yml"}:
-            import yaml
-
-            document = yaml.safe_load(text)
+            cat = _update_catalog(state, self.catalog, event.catalog)
         else:
-            document = json.loads(_strip_json_line_comments(text))
-        if not isinstance(document, dict):
-            raise ValueError
-        servers = document.get("mcpServers", document.get("servers", {}))
-        if servers is not None and (
-            not isinstance(servers, dict)
-            or any(not isinstance(name, str) for name in servers)
-        ):
-            raise ValueError
-        return path, document
-    except Exception:
-        raise SettingError("Cannot read MCP configuration; repair the file before editing.") from None
+            cat = _session_catalog(state, self.catalog)
+            if isinstance(event, SessionRestored) and cat is not self.catalog:
+                cat.update(self.catalog.virtual_tools)
+        _publish_virtual_schemas(state, cat)
 
 
-def _server_setting(name, field, value=None, ctx=None):
-    path, document = _settings_document()
-    servers = document.get("mcpServers", document.get("servers", {})) or {}
-    entry = servers.get(name)
-    if not isinstance(entry, dict):
-        raise SettingError("MCP server configuration changed; reload settings.")
-    key = field
-    if field == "timeout_seconds" and "timeout_seconds" not in entry and "timeout" in entry:
-        key = "timeout"
-    if value is None:
-        raw = entry.get(key, True if field == "enabled" else _DEFAULT_TIMEOUT_SECONDS)
-        if field == "enabled":
+# ---------------------------------------------------------------------------
+# /config Settings (pure Sans-I/O via in-memory _SettingsBox + StoreUpdate)
+# ---------------------------------------------------------------------------
+
+class _SettingsBox:
+    """Pure in-memory container for MCP settings loaded once at feature build time.
+
+    Performs zero filesystem I/O; ``set_value`` updates memory and schedules
+    crash-safe persistence via ``ctx.submit_persist_io(StoreUpdate(...))``.
+    """
+
+    def __init__(
+        self,
+        document: dict[str, Any],
+        *,
+        config_filename: str = "mcp_servers.json",
+        load_error: str | None = None,
+    ) -> None:
+        self.document: dict[str, Any] = copy.deepcopy(document)
+        self.config_filename: str = config_filename
+        self.load_error: str | None = load_error
+
+    def _entry(self, name: str, field_name: str) -> tuple[dict[str, Any], str]:
+        if self.load_error is not None:
+            raise SettingError(self.load_error)
+        servers = self.document.get("mcpServers", self.document.get("servers", {})) or {}
+        entry = servers.get(name)
+        if not isinstance(entry, dict):
+            raise SettingError("MCP server configuration changed; reload settings.")
+        key = field_name
+        if field_name == "timeout_seconds" and "timeout_seconds" not in entry and "timeout" in entry:
+            key = "timeout"
+        return entry, key
+
+    def get_value(self, name: str, field_name: str) -> bool | int:
+        entry, key = self._entry(name, field_name)
+        raw = entry.get(key, True if field_name == "enabled" else _DEFAULT_TIMEOUT_SECONDS)
+        if field_name == "enabled":
             if type(raw) is not bool:
                 raise SettingError("MCP enabled must be a boolean.")
             return raw
@@ -2341,54 +2437,89 @@ def _server_setting(name, field, value=None, ctx=None):
             return int(milliseconds)
         except (InvalidOperation, ValueError):
             raise SettingError("MCP timeout must be exact milliseconds between 1000 and 600000.") from None
-    if field == "enabled":
-        if type(value) is not bool:
-            raise SettingError("MCP enabled must be a boolean.")
-        entry[key] = value
-    else:
-        if type(value) is not int or not 1000 <= value <= 600000:
-            raise SettingError("MCP timeout must be integer milliseconds between 1000 and 600000.")
-        entry[key] = value / 1000
-    temporary = None
+
+    def set_value(self, name: str, field_name: str, value: Any, ctx: Any) -> None:
+        entry, key = self._entry(name, field_name)
+        if field_name == "enabled":
+            if type(value) is not bool:
+                raise SettingError("MCP enabled must be a boolean.")
+            new_val: Any = value
+        else:
+            if type(value) is not int or not 1000 <= value <= 600000:
+                raise SettingError("MCP timeout must be integer milliseconds between 1000 and 600000.")
+            new_val = value / 1000
+
+        previous = copy.deepcopy(self.document)
+        entry[key] = new_val
+        updated = copy.deepcopy(self.document)
+
+        def _rollback() -> None:
+            self.document = previous
+
+        if ctx is not None and callable(getattr(ctx, "submit_persist_io", None)):
+            ctx.submit_persist_io(
+                StoreUpdate(
+                    plugin=_PLUGIN_NAME,
+                    scope="config",
+                    config_filename=self.config_filename,
+                    value=updated,
+                ),
+                rollback=_rollback,
+            )
+        if ctx is not None and callable(getattr(ctx, "submit_io", None)):
+            ctx.submit_io(MCPSyncCatalogRequest(force=True), tag="mcp_settings")
+
+
+def _resolve_config_filename(path: Path) -> str:
+    """Preserve the relative path under ``plugin-configs/azo-plugin-mcp-client/``."""
+    config_dir = _user_config_dir()
     try:
+        rel = path.relative_to(config_dir).as_posix()
+        if rel and rel != ".":
+            return rel
+    except ValueError:
+        pass
+    return path.name or "mcp_servers.json"
+
+
+def _load_settings_box() -> _SettingsBox:
+    """Build-time config loader populating an in-memory ``_SettingsBox``."""
+    path = _default_config_path()
+    config_filename = _resolve_config_filename(path)
+    try:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return _SettingsBox({}, config_filename=config_filename)
         if path.suffix.lower() in {".yaml", ".yml"}:
             import yaml
 
-            text = yaml.safe_dump(document, sort_keys=False)
+            document = yaml.safe_load(text)
         else:
-            text = json.dumps(document, ensure_ascii=False, indent=2) + "\n"
-        # Bundled examples are read-only defaults, unless explicitly selected via env.
-        if not os.environ.get(_CONFIG_ENV, "").strip() and path.parent == _PLUGIN_ROOT:
-            path = _user_config_dir() / path.name
-        path = path.resolve()  # Preserve existing symlinks by replacing their target.
-        path.parent.mkdir(parents=True, exist_ok=True)
-        mode = path.stat().st_mode & 0o7777 if path.exists() else 0o600
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=path.parent,
-            prefix=".mcp-settings-",
-            delete=False,
-        ) as stream:
-            temporary = Path(stream.name)
-            stream.write(text)
-        temporary.chmod(mode)
-        os.replace(temporary, path)
+            document = json.loads(_strip_json_line_comments(text))
+        if not isinstance(document, dict):
+            raise ValueError
+        servers = document.get("mcpServers", document.get("servers", {}))
+        if servers is not None and (
+            not isinstance(servers, dict)
+            or any(not isinstance(name, str) for name in servers)
+        ):
+            raise ValueError
+        return _SettingsBox(document, config_filename=config_filename)
     except Exception:
-        raise SettingError("Cannot save MCP configuration.") from None
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
-    if ctx is not None and callable(getattr(ctx, "submit_io", None)):
-        ctx.submit_io(MCPSyncCatalogRequest(force=True), tag="mcp_settings")
+        return _SettingsBox(
+            {},
+            config_filename=config_filename,
+            load_error="Cannot read MCP configuration; repair the file and reload.",
+        )
 
 
-def _mcp_settings():
-    try:
-        _, document = _settings_document()
-    except SettingError:
+def _mcp_settings() -> list[Setting]:
+    box = _load_settings_box()
+    if box.load_error is not None:
         def unreadable(ctx):
-            raise SettingError("Cannot read MCP configuration; repair the file and reload.")
+            del ctx
+            raise SettingError(box.load_error or "Cannot read MCP configuration; repair the file and reload.")
 
         return [
             Setting(
@@ -2400,25 +2531,25 @@ def _mcp_settings():
                 apply="reload",
             )
         ]
-    settings = []
-    servers = document.get("mcpServers", document.get("servers", {})) or {}
+    settings: list[Setting] = []
+    servers = box.document.get("mcpServers", box.document.get("servers", {})) or {}
     for name, entry in servers.items():
         if not isinstance(entry, dict):
             continue
         # Stable keys do not depend on server-name punctuation or disclose connection data.
         prefix = "mcp.server_" + hashlib.sha256(name.encode()).hexdigest()[:16]
-        for field, label, kind, bounds in (
+        for field_name, label, kind, bounds in (
             ("enabled", "Enabled", "bool", {}),
             ("timeout_seconds", "Timeout (ms)", "int", {"min": 1000, "max": 600000}),
         ):
-            setting_key = "timeout_ms" if field == "timeout_seconds" else field
+            setting_key = "timeout_ms" if field_name == "timeout_seconds" else field_name
             settings.append(
                 Setting(
                     f"{prefix}.{setting_key}",
                     f"{_clean_token(name)[:100]}: {label}",
                     kind,
-                    get=lambda ctx, n=name, f=field: _server_setting(n, f),
-                    set=lambda ctx, value, n=name, f=field: _server_setting(n, f, value, ctx=ctx),
+                    get=lambda ctx, _box=box, n=name, f=field_name: _box.get_value(n, f),
+                    set=lambda ctx, value, _box=box, n=name, f=field_name: _box.set_value(n, f, value, ctx),
                     group="MCP",
                     apply="live",
                     help=(
@@ -2467,31 +2598,12 @@ def mcp_client_feature(
             MCPToolSchemaPublisher,
         ],
         drivers=drivers,
+        durable_state=MCP_CLIENT_DURABLE_SPEC,
     )
 
 
 def register_features(builder, *, session, config):
     """Register MCP settings and Sans-I/O MCP client + driver features."""
-    shared_catalog = MCPCatalog()
+    del session, config
     builder.add(Feature(name="mcp_settings", components=_mcp_settings(), order=[Setting]))
-    builder.add(
-        Feature(
-            name="mcp_client_addon",
-            components=[
-                MCPStatusTool(shared_catalog),
-                MCPRefreshTool(shared_catalog),
-                SearchMCPTool(shared_catalog),
-                EnableMCPTool(shared_catalog),
-                MCPVirtualToolRouter(shared_catalog),
-                MCPToolSchemaPublisher(shared_catalog),
-            ],
-            order=[
-                Tool,
-                MCPVirtualToolRouter,
-                UnknownToolFallback,
-                SchemaPublisher,
-                MCPToolSchemaPublisher,
-            ],
-            drivers=[lambda _cfg=None: MCPClientDriver()],
-        )
-    )
+    builder.add(mcp_client_feature())
