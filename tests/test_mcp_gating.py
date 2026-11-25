@@ -406,7 +406,56 @@ class GatingTests(unittest.TestCase):
         with patch.dict(os.environ, {"AGENT_ZOO_HOME": "/state", "AGENT_ZOO_INSTALL_ROOT": "/code"}, clear=True):
             self.assertEqual(mcp._user_config_dir(), Path("/state/plugin-configs/azo-plugin-mcp-client"))
         with patch.dict(os.environ, {"AGENT_ZOO_STATE_ROOT": "/state2"}, clear=True):
-            self.assertEqual(mcp._agent_zoo_data_root(), Path("/state2"))
+            self.assertEqual(mcp._user_config_dir(), Path("/state2/plugin-configs/azo-plugin-mcp-client"))
+
+    def test_stdio_client_fork_safety_and_process_group_teardown(self):
+        import signal
+        import subprocess
+        import sys
+        import time
+
+        # Verify start_new_session=True, _owner_pid fork safety, and killpg teardown of descendants.
+        cfg = mcp.MCPServerConfig(name="pg-test", command=sys.executable)
+        client = mcp.StdioMCPClient(cfg)
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)",
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        client.process = proc
+        client._owner_pid = os.getpid() + 1  # simulate inherited handle in forked child
+        try:
+            # Forked child must NOT signal or kill parent's process.
+            client.close()
+            self.assertIsNone(proc.poll())
+            # Restore ownership and close from owner PID -> escalates via os.killpg to SIGKILL.
+            client.process = proc
+            client._owner_pid = os.getpid()
+            killpg_calls = []
+            real_killpg = os.killpg
+
+            def spy_killpg(pgid, sig):
+                killpg_calls.append((pgid, sig))
+                return real_killpg(pgid, sig)
+
+            with patch.object(mcp.os, "killpg", side_effect=spy_killpg):
+                client.close()
+            self.assertIsNotNone(proc.poll())
+            self.assertEqual(killpg_calls, [(proc.pid, signal.SIGTERM), (proc.pid, signal.SIGKILL)])
+        finally:
+            if proc.poll() is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except OSError:
+                    proc.kill()
+                proc.wait(timeout=2.0)
 
     def test_canonical_session_restore_preserves_only_explicit_selection(self):
         original, _, driver_orig = build_mcp_session(self.registry)

@@ -54,6 +54,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import signal
 import subprocess
 import threading
 import time
@@ -75,7 +76,12 @@ from agent_utils.core.pipeline import EmitFn, Feature
 from agent_utils.core.state import DurableSpec, State, ToolCall
 from agent_utils.core.tool import Tool
 from agent_utils.features.core import SchemaPublisher, UnknownToolFallback
-from agent_zoo.durability import PluginStorage, StoreUpdate, ThreadPoolDriver
+from agent_zoo.durability import (
+    PluginConfigBox,
+    PluginConfigStore,
+    PluginStorage,
+    ThreadPoolDriver,
+)
 from agent_zoo.features.settings import Setting, SettingError
 
 log = logging.getLogger("agent_zoo_user_plugin.mcp_client")
@@ -255,10 +261,6 @@ def _shorten_tool_name(name: str) -> str:
     return f"{name[:keep].rstrip('_-')}_{digest}"
 
 
-def _agent_zoo_data_root() -> Path:
-    return PluginStorage(_PLUGIN_NAME).state_root
-
-
 def _user_config_dir() -> Path:
     return PluginStorage(_PLUGIN_NAME).config_dir
 
@@ -435,6 +437,7 @@ class StdioMCPClient:
     def __init__(self, config: MCPServerConfig):
         self.config = config
         self.process: subprocess.Popen[str] | None = None
+        self._owner_pid: int | None = os.getpid()
         self._next_id = 1
         self._lifecycle_lock = threading.RLock()
         self._write_lock = threading.Lock()
@@ -482,11 +485,13 @@ class StdioMCPClient:
                     encoding="utf-8",
                     errors="replace",
                     bufsize=1,
+                    start_new_session=True,
                 )
             except Exception as exc:
                 self.last_error = f"failed to start MCP server {self.config.name}: {exc}"
                 raise MCPError(self.last_error) from exc
             self.process = proc
+            self._owner_pid = os.getpid()
             self._stdout_closed = False
             self._stdout_thread = threading.Thread(
                 target=self._stdout_loop,
@@ -509,9 +514,29 @@ class StdioMCPClient:
                 self.close()
                 raise
 
+    @staticmethod
+    def _signal_process_group(proc: subprocess.Popen[str], sig: int) -> None:
+        """Signal the spawned process group so wrapper descendants (npx/uvx) terminate too."""
+        if proc.poll() is not None:
+            return
+        try:
+            os.killpg(proc.pid, sig)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            if proc.poll() is None:
+                try:
+                    if sig == signal.SIGKILL:
+                        proc.kill()
+                    else:
+                        proc.terminate()
+                except OSError:
+                    pass
+
     def close(self) -> None:
         with self._lifecycle_lock:
             proc = self.process
+            owner_pid = self._owner_pid
             self.process = None
             self._initialized = False
             self._modern_confirmed = False
@@ -529,7 +554,11 @@ class StdioMCPClient:
                 self._condition.notify_all()
             if proc is None:
                 return
-            # EOF is the portable shutdown signal; then escalate and reap.
+            # Fork safety: a forked child must never signal or close its parent's MCP process.
+            if owner_pid is not None and os.getpid() != owner_pid:
+                self._stdout_thread = self._stderr_thread = None
+                return
+            # EOF is the portable shutdown signal; then escalate to the process group and reap.
             try:
                 with self._write_lock:
                     if proc.stdin is not None:
@@ -537,16 +566,16 @@ class StdioMCPClient:
                 try:
                     proc.wait(timeout=0.25)
                 except subprocess.TimeoutExpired:
-                    proc.terminate()
+                    self._signal_process_group(proc, signal.SIGTERM)
                     try:
                         proc.wait(timeout=0.5)
                     except subprocess.TimeoutExpired:
-                        proc.kill()
+                        self._signal_process_group(proc, signal.SIGKILL)
                         proc.wait(timeout=1.0)
             except (OSError, ValueError, subprocess.TimeoutExpired):
                 if proc.poll() is None:
                     try:
-                        proc.kill()
+                        self._signal_process_group(proc, signal.SIGKILL)
                         proc.wait(timeout=1.0)
                     except (OSError, subprocess.TimeoutExpired):
                         pass
@@ -1843,17 +1872,6 @@ class MCPClientDriver(ThreadPoolDriver):
                 return
         self._safe_emit(MCPCatalogUpdated(catalog=dict(catalog)))
 
-    def quiesce(
-        self,
-        *,
-        policy: str = "terminate",
-        deadline: float | None = None,
-    ) -> list[Event]:
-        return super().quiesce(
-            policy=policy,
-            deadline=time.monotonic() if deadline is None else deadline,
-        )
-
     def on_close(self) -> None:
         self.registry._on_catalog_change = None
         self.registry.close_all()
@@ -2301,88 +2319,22 @@ class MCPToolSchemaPublisher:
 
 
 # ---------------------------------------------------------------------------
-# /config Settings (pure Sans-I/O via in-memory _SettingsBox + StoreUpdate)
+# /config Settings (pure Sans-I/O via PluginConfigBox)
 # ---------------------------------------------------------------------------
 
-class _SettingsBox:
-    """Pure in-memory container for MCP settings loaded once at feature build time.
+_MCP_CONFIG_ERROR = "Cannot read MCP configuration; repair the file and reload."
 
-    Performs zero filesystem I/O; ``set_value`` updates memory and schedules
-    crash-safe persistence via ``ctx.submit_persist_io(StoreUpdate(...))``.
-    """
 
-    def __init__(
-        self,
-        document: dict[str, Any],
-        *,
-        config_filename: str = "mcp_servers.json",
-        load_error: str | None = None,
-    ) -> None:
-        self.document: dict[str, Any] = copy.deepcopy(document)
-        self.config_filename: str = config_filename
-        self.load_error: str | None = load_error
-
-    def _entry(self, name: str, field_name: str) -> tuple[dict[str, Any], str]:
-        if self.load_error is not None:
-            raise SettingError(self.load_error)
-        servers = self.document.get("mcpServers", self.document.get("servers", {})) or {}
-        entry = servers.get(name)
-        if not isinstance(entry, dict):
-            raise SettingError("MCP server configuration changed; reload settings.")
-        key = field_name
-        if field_name == "timeout_seconds" and "timeout_seconds" not in entry and "timeout" in entry:
-            key = "timeout"
-        return entry, key
-
-    def get_value(self, name: str, field_name: str) -> bool | int:
-        entry, key = self._entry(name, field_name)
-        raw = entry.get(key, True if field_name == "enabled" else _DEFAULT_TIMEOUT_SECONDS)
-        if field_name == "enabled":
-            if type(raw) is not bool:
-                raise SettingError("MCP enabled must be a boolean.")
-            return raw
-        try:
-            milliseconds = Decimal(str(raw)) * 1000
-            if (
-                not milliseconds.is_finite()
-                or milliseconds != milliseconds.to_integral_value()
-                or not 1000 <= milliseconds <= 600000
-            ):
-                raise ValueError
-            return int(milliseconds)
-        except (InvalidOperation, ValueError):
-            raise SettingError("MCP timeout must be exact milliseconds between 1000 and 600000.") from None
-
-    def set_value(self, name: str, field_name: str, value: Any, ctx: Any) -> None:
-        entry, key = self._entry(name, field_name)
-        if field_name == "enabled":
-            if type(value) is not bool:
-                raise SettingError("MCP enabled must be a boolean.")
-            new_val: Any = value
-        else:
-            if type(value) is not int or not 1000 <= value <= 600000:
-                raise SettingError("MCP timeout must be integer milliseconds between 1000 and 600000.")
-            new_val = value / 1000
-
-        previous = copy.deepcopy(self.document)
-        entry[key] = new_val
-        updated = copy.deepcopy(self.document)
-
-        def _rollback() -> None:
-            self.document = previous
-
-        if ctx is not None and callable(getattr(ctx, "submit_persist_io", None)):
-            ctx.submit_persist_io(
-                StoreUpdate(
-                    plugin=_PLUGIN_NAME,
-                    scope="config",
-                    config_filename=self.config_filename,
-                    value=updated,
-                ),
-                rollback=_rollback,
-            )
-        if ctx is not None and callable(getattr(ctx, "submit_io", None)):
-            ctx.submit_io(MCPSyncCatalogRequest(force=True), tag="mcp_settings")
+def _validate_mcp_config_doc(document: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(document, dict):
+        raise ValueError("MCP configuration must be a mapping")
+    servers = document.get("mcpServers", document.get("servers", {}))
+    if servers is not None and (
+        not isinstance(servers, dict)
+        or any(not isinstance(name, str) for name in servers)
+    ):
+        raise ValueError("MCP servers section must be a mapping")
+    return document
 
 
 def _resolve_config_filename(path: Path) -> str:
@@ -2397,44 +2349,103 @@ def _resolve_config_filename(path: Path) -> str:
     return path.name or "mcp_servers.json"
 
 
-def _load_settings_box() -> _SettingsBox:
-    """Build-time config loader populating an in-memory ``_SettingsBox``."""
+def _load_config_box() -> PluginConfigBox:
+    """Build-time config loader returning a ``PluginConfigBox`` for ``/config``."""
     path = _default_config_path()
     config_filename = _resolve_config_filename(path)
-    try:
+    default_user_path = _user_config_dir() / config_filename
+    store = PluginConfigStore(path) if path != default_user_path else None
+    box = PluginConfigBox(
+        _PLUGIN_NAME,
+        config_filename=config_filename,
+        validate=_validate_mcp_config_doc,
+        store=store,
+    )
+    if box.load_error is None and box.path.is_file():
         try:
-            text = path.read_text(encoding="utf-8")
-        except FileNotFoundError:
-            return _SettingsBox({}, config_filename=config_filename)
-        if path.suffix.lower() in {".yaml", ".yml"}:
-            import yaml
+            if not box.path.read_text(encoding="utf-8").strip():
+                box.load_error = _MCP_CONFIG_ERROR
+        except OSError:
+            box.load_error = _MCP_CONFIG_ERROR
+    elif box.load_error is not None:
+        box.load_error = _MCP_CONFIG_ERROR
+    return box
 
-            document = yaml.safe_load(text)
-        else:
-            document = json.loads(_strip_json_line_comments(text))
-        if not isinstance(document, dict):
-            raise ValueError
-        servers = document.get("mcpServers", document.get("servers", {}))
-        if servers is not None and (
-            not isinstance(servers, dict)
-            or any(not isinstance(name, str) for name in servers)
+
+def _mcp_server_entry(
+    document: dict[str, Any], name: str, field_name: str
+) -> tuple[str, dict[str, Any], str]:
+    if "mcpServers" in document:
+        servers_key = "mcpServers"
+    elif "servers" in document:
+        servers_key = "servers"
+    else:
+        raise SettingError("MCP server configuration changed; reload settings.")
+    servers = document.get(servers_key)
+    if not isinstance(servers, dict):
+        raise SettingError("MCP server configuration changed; reload settings.")
+    entry = servers.get(name)
+    if not isinstance(entry, dict):
+        raise SettingError("MCP server configuration changed; reload settings.")
+    key = field_name
+    if field_name == "timeout_seconds" and "timeout_seconds" not in entry and "timeout" in entry:
+        key = "timeout"
+    return servers_key, entry, key
+
+
+def _get_mcp_setting(box: PluginConfigBox, name: str, field_name: str) -> bool | int:
+    doc = box.require_loaded()
+    _, entry, key = _mcp_server_entry(doc, name, field_name)
+    raw = entry.get(key, True if field_name == "enabled" else _DEFAULT_TIMEOUT_SECONDS)
+    if field_name == "enabled":
+        if type(raw) is not bool:
+            raise SettingError("MCP enabled must be a boolean.")
+        return raw
+    try:
+        milliseconds = Decimal(str(raw)) * 1000
+        if (
+            not milliseconds.is_finite()
+            or milliseconds != milliseconds.to_integral_value()
+            or not 1000 <= milliseconds <= 600000
         ):
             raise ValueError
-        return _SettingsBox(document, config_filename=config_filename)
-    except Exception:
-        return _SettingsBox(
-            {},
-            config_filename=config_filename,
-            load_error="Cannot read MCP configuration; repair the file and reload.",
-        )
+        return int(milliseconds)
+    except (InvalidOperation, ValueError):
+        raise SettingError("MCP timeout must be exact milliseconds between 1000 and 600000.") from None
+
+
+def _set_mcp_setting(
+    box: PluginConfigBox, name: str, field_name: str, value: Any, ctx: Any
+) -> None:
+    if field_name == "enabled":
+        if type(value) is not bool:
+            raise SettingError("MCP enabled must be a boolean.")
+        new_val: Any = value
+    else:
+        if type(value) is not int or not 1000 <= value <= 600000:
+            raise SettingError("MCP timeout must be integer milliseconds between 1000 and 600000.")
+        new_val = value / 1000
+
+    def _updater(doc: dict[str, Any]) -> dict[str, Any]:
+        servers_key, entry, key = _mcp_server_entry(doc, name, field_name)
+        updated_servers = dict(doc[servers_key])
+        updated_entry = dict(entry)
+        updated_entry[key] = new_val
+        updated_servers[name] = updated_entry
+        doc[servers_key] = updated_servers
+        return doc
+
+    box.mutate(ctx, _updater, require_persist=False, tag="mcp_settings")
+    if ctx is not None and callable(getattr(ctx, "submit_io", None)):
+        ctx.submit_io(MCPSyncCatalogRequest(force=True), tag="mcp_settings")
 
 
 def _mcp_settings() -> list[Setting]:
-    box = _load_settings_box()
+    box = _load_config_box()
     if box.load_error is not None:
         def unreadable(ctx):
             del ctx
-            raise SettingError(box.load_error or "Cannot read MCP configuration; repair the file and reload.")
+            raise SettingError(box.load_error or _MCP_CONFIG_ERROR)
 
         return [
             Setting(
@@ -2447,7 +2458,7 @@ def _mcp_settings() -> list[Setting]:
             )
         ]
     settings: list[Setting] = []
-    servers = box.document.get("mcpServers", box.document.get("servers", {})) or {}
+    servers = box.data.get("mcpServers", box.data.get("servers", {})) or {}
     for name, entry in servers.items():
         if not isinstance(entry, dict):
             continue
@@ -2463,8 +2474,8 @@ def _mcp_settings() -> list[Setting]:
                     f"{prefix}.{setting_key}",
                     f"{_clean_token(name)[:100]}: {label}",
                     kind,
-                    get=lambda ctx, _box=box, n=name, f=field_name: _box.get_value(n, f),
-                    set=lambda ctx, value, _box=box, n=name, f=field_name: _box.set_value(n, f, value, ctx),
+                    get=lambda ctx, _box=box, n=name, f=field_name: _get_mcp_setting(_box, n, f),
+                    set=lambda ctx, value, _box=box, n=name, f=field_name: _set_mcp_setting(_box, n, f, value, ctx),
                     group="MCP",
                     apply="live",
                     help=(

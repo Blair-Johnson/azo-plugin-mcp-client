@@ -239,6 +239,40 @@ class SettingsTests(unittest.TestCase):
             json.loads(self.path.read_text(encoding="utf-8"))["mcpServers"][name]["enabled"]
         )
 
+    def test_persist_preserves_concurrent_sibling_server_edit_on_disk(self):
+        self.path.write_text(
+            json.dumps({
+                "mcpServers": {
+                    "alpha": {"command": "unused-a", "enabled": True},
+                    "beta": {"command": "unused-b", "enabled": True},
+                }
+            }),
+            encoding="utf-8",
+        )
+        session, _ = build_settings_session()
+        listing = dispatch_settings(session, action="list")
+        # Another process updates beta on disk after our PluginConfigBox loaded.
+        disk_doc = json.loads(self.path.read_text(encoding="utf-8"))
+        disk_doc["mcpServers"]["beta"]["enabled"] = False
+        self.path.write_text(json.dumps(disk_doc), encoding="utf-8")
+
+        alpha_key = next(
+            row["key"]
+            for row in listing["settings"]
+            if row["label"].startswith("alpha:") and row["key"].endswith(".enabled")
+        )
+        res = dispatch_settings(
+            session,
+            action="set",
+            binding=listing["binding"],
+            key=alpha_key,
+            value=False,
+        )
+        self.assertTrue(res["ok"], res)
+        persisted = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertFalse(persisted["mcpServers"]["alpha"]["enabled"])
+        self.assertFalse(persisted["mcpServers"]["beta"]["enabled"])
+
 
 if __name__ == "__main__":
     unittest.main()
