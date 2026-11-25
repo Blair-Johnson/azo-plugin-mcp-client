@@ -18,7 +18,7 @@ Architecture:
     publishing only explicitly enabled virtual MCP schemas onto
     ``state.tool_schemas`` and stripping legacy eager MCP schemas.
 - External IO runtime layer:
-  * ``MCPClientDriver`` (subclass of ``agent_utils.runtime.driver.Driver``),
+  * ``MCPClientDriver`` (subclass of ``agent_zoo.durability.ThreadPoolDriver``),
     contributed via ``Feature(..., drivers=[...])``, owning ``MCPClientRegistry``,
     ``StdioMCPClient``, ``StreamableHTTPMCPClient``, config loading, background
     discovery threads, and clean shutdown on ``close()``.
@@ -44,7 +44,6 @@ installed by agent-zoo, but JSON configs require no optional imports.
 
 from collections import deque
 from collections.abc import Callable, Iterable
-from concurrent.futures import Future, ThreadPoolExecutor
 import copy
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
@@ -71,15 +70,13 @@ from agent_utils.core.events import (
     ToolCallFinished,
     TurnSettled,
 )
-from agent_utils.core.io import IoRequest, OpId
+from agent_utils.core.io import IoRequest
 from agent_utils.core.pipeline import EmitFn, Feature
 from agent_utils.core.state import DurableSpec, State, ToolCall
 from agent_utils.core.tool import Tool
 from agent_utils.features.core import SchemaPublisher, UnknownToolFallback
-from agent_utils.runtime.driver import Driver
-from agent_zoo.durability import PluginStorage, StoreUpdate
+from agent_zoo.durability import PluginStorage, StoreUpdate, ThreadPoolDriver
 from agent_zoo.features.settings import Setting, SettingError
-from agent_zoo.storage.projects import resolve_state_root
 
 log = logging.getLogger("agent_zoo_user_plugin.mcp_client")
 
@@ -259,7 +256,7 @@ def _shorten_tool_name(name: str) -> str:
 
 
 def _agent_zoo_data_root() -> Path:
-    return resolve_state_root()
+    return PluginStorage(_PLUGIN_NAME).state_root
 
 
 def _user_config_dir() -> Path:
@@ -1815,11 +1812,14 @@ class MCPClientRuntime:
 # Runtime Driver (imperative IO shell)
 # ---------------------------------------------------------------------------
 
-class MCPClientDriver(Driver):
+class MCPClientDriver(ThreadPoolDriver):
     """Runtime IO driver owning ``MCPClientRegistry`` and executing ``MCPRequest``s."""
 
     durability = "process_bound"
     request_types = (MCPRequest,)
+    max_workers = 4
+    worker_prefix = "agent-zoo-mcp"
+    interrupt_on_quiesce = True
 
     def __init__(
         self,
@@ -1827,25 +1827,11 @@ class MCPClientDriver(Driver):
         *,
         max_workers: int = 4,
     ) -> None:
-        super().__init__()
+        super().__init__(max_workers=max_workers)
         self.registry = registry if registry is not None else MCPClientRegistry()
-        self._max_workers = max(1, int(max_workers))
-        self._lock = threading.Lock()
-        self._executor: ThreadPoolExecutor | None = None
-        self._futures: dict[OpId, Future[Any]] = {}
-        self._in_flight: dict[OpId, MCPRequest] = {}
-        self._cancelled: set[OpId] = set()
-        self._closed = False
 
     def start(self, emit: EmitFn) -> None:
         super().start(emit)
-        with self._lock:
-            self._closed = False
-            if self._executor is None:
-                self._executor = ThreadPoolExecutor(
-                    max_workers=self._max_workers,
-                    thread_name_prefix="agent-zoo-mcp",
-                )
         self.registry._on_catalog_change = self._on_catalog_change
         initial = self.registry.virtual_tools
         if initial:
@@ -1857,93 +1843,22 @@ class MCPClientDriver(Driver):
                 return
         self._safe_emit(MCPCatalogUpdated(catalog=dict(catalog)))
 
-    def submit(self, op_id: OpId, req: IoRequest) -> None:
-        if not isinstance(req, MCPRequest):
-            raise TypeError(f"MCPClientDriver expected MCPRequest, got {type(req).__name__}")
-        with self._lock:
-            if self._closed or op_id in self._cancelled:
-                return
-            if self._executor is None:
-                self._executor = ThreadPoolExecutor(
-                    max_workers=self._max_workers,
-                    thread_name_prefix="agent-zoo-mcp",
-                )
-            fut = self._executor.submit(self._execute, op_id, req)
-            self._futures[op_id] = fut
-            self._in_flight[op_id] = req
-
-    def cancel(self, op_id: OpId) -> None:
-        with self._lock:
-            self._cancelled.add(op_id)
-            fut = self._futures.get(op_id)
-            self._in_flight.pop(op_id, None)
-        if fut is not None:
-            fut.cancel()
-
     def quiesce(
         self,
         *,
         policy: str = "terminate",
         deadline: float | None = None,
     ) -> list[Event]:
-        del deadline
-        with self._lock:
-            in_flight = list(self._in_flight.items())
-            futures = list(self._futures.values())
-            for op_id, _req in in_flight:
-                self._cancelled.add(op_id)
-            self._in_flight.clear()
-            self._futures.clear()
-        for fut in futures:
-            fut.cancel()
-        reason = f"quiesce:{policy}"
-        return [
-            IoInterrupted(op_id=op_id, reason=reason)
-            for op_id, _req in in_flight
-        ]
+        return super().quiesce(
+            policy=policy,
+            deadline=time.monotonic() if deadline is None else deadline,
+        )
 
-    def close(self) -> None:
-        with self._lock:
-            self._closed = True
-            futures = list(self._futures.values())
-            self._cancelled.update(self._futures.keys())
-            self._futures.clear()
-            self._in_flight.clear()
-            executor = self._executor
-            self._executor = None
+    def on_close(self) -> None:
         self.registry._on_catalog_change = None
-        for fut in futures:
-            fut.cancel()
-        try:
-            self.registry.close_all()
-        finally:
-            if executor is not None:
-                executor.shutdown(wait=True, cancel_futures=True)
-            with self._lock:
-                self._cancelled.clear()
+        self.registry.close_all()
 
-    def _is_fenced(self, op_id: OpId) -> bool:
-        with self._lock:
-            return self._closed or op_id in self._cancelled
-
-    def _execute(self, op_id: OpId, req: MCPRequest) -> None:
-        try:
-            if self._is_fenced(op_id):
-                return
-            value = self._dispatch_request(req)
-            if self._is_fenced(op_id):
-                return
-            self._safe_emit(IoCompleted(op_id=op_id, value=value))
-        except Exception as exc:
-            if not self._is_fenced(op_id):
-                self._safe_emit(IoFailed(op_id=op_id, error=exc))
-        finally:
-            with self._lock:
-                self._futures.pop(op_id, None)
-                self._in_flight.pop(op_id, None)
-                self._cancelled.discard(op_id)
-
-    def _dispatch_request(self, req: MCPRequest) -> Any:
+    def execute(self, req: IoRequest) -> Any:
         if isinstance(req, MCPStatusRequest):
             text = self.registry.status_text(enabled=set(req.enabled))
             return MCPStatusResult(text=text, catalog=self.registry.virtual_tools)
@@ -2602,8 +2517,8 @@ def mcp_client_feature(
     )
 
 
-def register_features(builder, *, session, config):
+def register_features(builder, *, config):
     """Register MCP settings and Sans-I/O MCP client + driver features."""
-    del session, config
+    del config
     builder.add(Feature(name="mcp_settings", components=_mcp_settings(), order=[Setting]))
     builder.add(mcp_client_feature())

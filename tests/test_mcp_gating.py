@@ -93,7 +93,7 @@ def run_tool_call(
     if driver is not None:
         sim.register_handler(
             mcp.MCPRequest,
-            lambda _op_id, req, _sim: driver._dispatch_request(req),
+            lambda _op_id, req, _sim: driver.execute(req),
         )
     sim.inject(InputReceived(message=msg))
     sim.run_until_idle()
@@ -591,7 +591,7 @@ class GatingTests(unittest.TestCase):
             include_plugins=False,
             include_llm_drivers=False,
         )
-        mcp.register_features(builder, session=session, config={})
+        mcp.register_features(builder, config={})
         pipeline = builder.build()
         drivers = builder.build_drivers(config={})
         session.pipeline = pipeline

@@ -29,7 +29,7 @@ def build_settings_session():
     session = Session()
     builder = PipelineBuilder().add(core_feature()).add(settings_feature())
     with patch.object(mcp.StdioMCPClient, "start", side_effect=AssertionError("no server")):
-        mcp.register_features(builder, session=session, config={})
+        mcp.register_features(builder, config={})
         session.pipeline = builder.build()
     session.ensure_initialized()
     assert_pipeline_sans_io(session.pipeline)

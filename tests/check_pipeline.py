@@ -39,7 +39,7 @@ with tempfile.TemporaryDirectory(prefix="mcp-plugin-check-") as temporary:
                 include_plugins=False,
                 include_llm_drivers=False,
             )
-            mcp.register_features(builder, session=session, config={})
+            mcp.register_features(builder, config={})
             assert builder.has("mcp_client_addon"), name
             assert builder.has("mcp_settings"), name
             pipeline = builder.build()
