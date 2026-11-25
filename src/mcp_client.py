@@ -2533,3 +2533,461 @@ def register_features(builder, *, config):
     del config
     builder.add(Feature(name="mcp_settings", components=_mcp_settings(), order=[Setting]))
     builder.add(mcp_client_feature())
+
+
+# ---------------------------------------------------------------------------
+# Deterministic Simulation Testing (DST) Hooks
+# ---------------------------------------------------------------------------
+
+_SIM_MCP_SERVERS: tuple[dict[str, Any], ...] = (
+    {
+        "name": "filesystem",
+        "transport": "stdio",
+        "enabled": True,
+        "protocol_version": "2026-07-28",
+        "tools": (
+            {
+                "name": "read_file",
+                "description": "Read the contents of a file from the workspace",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                },
+            },
+            {
+                "name": "list_dir",
+                "description": "List files and directories under a workspace path",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                },
+            },
+            {
+                "name": "search_files",
+                "description": "Search workspace files matching a pattern",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": {"type": "string"},
+                        "path": {"type": "string"},
+                    },
+                    "required": ["pattern"],
+                },
+            },
+        ),
+    },
+    {
+        "name": "git",
+        "transport": "stdio",
+        "enabled": True,
+        "protocol_version": "2025-11-25",
+        "tools": (
+            {
+                "name": "status",
+                "description": "Show git working tree status",
+                "inputSchema": {"type": "object", "properties": {}},
+            },
+            {
+                "name": "log",
+                "description": "Show recent git commit history",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 50}},
+                },
+            },
+        ),
+    },
+    {
+        "name": "docs",
+        "transport": "http",
+        "enabled": True,
+        "protocol_version": "2026-07-28",
+        "tools": (
+            {
+                "name": "search",
+                "description": "Search technical documentation pages",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 20},
+                    },
+                    "required": ["query"],
+                },
+            },
+            {
+                "name": "fetch",
+                "description": "Fetch a documentation page by slug",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"slug": {"type": "string"}},
+                    "required": ["slug"],
+                },
+            },
+        ),
+    },
+    {
+        "name": "analytics",
+        "transport": "http",
+        "enabled": False,
+        "protocol_version": None,
+        "tools": (),
+    },
+)
+
+
+def _build_sim_virtual_tools() -> tuple[
+    dict[str, dict[str, Any]],
+    dict[str, MCPVirtualTool],
+    dict[str, set[str]],
+]:
+    servers: dict[str, dict[str, Any]] = {}
+    virtual_tools: dict[str, MCPVirtualTool] = {}
+    server_virtuals: dict[str, set[str]] = {}
+    for entry in _SIM_MCP_SERVERS:
+        sname = entry["name"]
+        servers[sname] = dict(entry)
+        if not entry["enabled"]:
+            continue
+        installed: set[str] = set()
+        for tool in entry["tools"]:
+            raw_name = tool["name"]
+            vname = _shorten_tool_name(f"mcp_{_clean_token(sname)}_{_clean_token(raw_name)}")
+            params = dict(tool["inputSchema"])
+            params.setdefault("type", "object")
+            params.setdefault("properties", {})
+            schema = {
+                "type": "function",
+                "function": {
+                    "name": vname,
+                    "description": f"[MCP:{sname}/{raw_name}] {tool['description']}",
+                    "parameters": params,
+                },
+            }
+            virtual_tools[vname] = MCPVirtualTool(
+                virtual_name=vname,
+                server_name=sname,
+                tool_name=raw_name,
+                schema=schema,
+                description=tool["description"],
+            )
+            installed.add(vname)
+        server_virtuals[sname] = installed
+    return servers, virtual_tools, server_virtuals
+
+
+class _SimMCPWorld:
+    """Strictly deterministic in-memory MCP catalog & tool execution simulator."""
+
+    def __init__(self) -> None:
+        self._servers, self._virtual_tools, self._server_virtuals = _build_sim_virtual_tools()
+        self._discovery_status: dict[str, str] = {
+            name: (f"ok: {len(self._server_virtuals.get(name, set()))} tool(s)" if cfg["enabled"] else "disabled")
+            for name, cfg in self._servers.items()
+        }
+        self._call_seq = 0
+        self._refresh_seq = 0
+
+    @property
+    def virtual_tools(self) -> dict[str, MCPVirtualTool]:
+        return dict(self._virtual_tools)
+
+    def status_text(self, enabled: Iterable[str] | None = None) -> str:
+        enabled_set = set(enabled) if enabled is not None else None
+        lines: list[str] = []
+        for name, cfg in sorted(self._servers.items()):
+            if not cfg["enabled"]:
+                phase = "disabled"
+                tools = None
+            else:
+                ver = cfg.get("protocol_version")
+                phase = f"connected (MCP {ver})" if ver else "connected"
+                tools = self._server_virtuals.get(name, set())
+            catalog = (
+                "catalog not loaded"
+                if tools is None
+                else f"{len(tools)} tool{'s' if len(tools) != 1 else ''}"
+            )
+            parts = [f"{name}: {phase}", catalog]
+            if enabled_set is not None:
+                parts.append(f"{len((tools or set()) & enabled_set)} enabled")
+            lines.append("; ".join(parts))
+        return "\n".join(lines) or "No MCP servers configured."
+
+    def refresh(
+        self,
+        *,
+        server: str | None = None,
+        enabled: Iterable[str] | None = None,
+    ) -> str:
+        self._refresh_seq += 1
+        if server:
+            name = _clean_token(server)
+            if name not in self._servers:
+                return (
+                    f"ERROR: unknown MCP server {server!r}. "
+                    f"Configured servers: {', '.join(sorted(self._servers)) or '(none)'}"
+                )
+        return self.status_text(enabled=enabled)
+
+    def search_tools(
+        self,
+        *,
+        query: str = "",
+        server: str | None = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        _validate_search_args(query=query, server=server, limit=limit, offset=offset)
+        if server is not None and _clean_token(server) not in self._servers:
+            raise MCPError(f"unknown MCP server {server!r}")
+        names = [_clean_token(server)] if server is not None else sorted(self._servers)
+        terms = query.casefold().split()
+        matches: list[dict[str, Any]] = []
+        for tool in sorted(self._virtual_tools.values(), key=lambda item: item.virtual_name):
+            if tool.server_name not in names:
+                continue
+            text = " ".join((tool.virtual_name, tool.server_name, tool.tool_name, tool.description)).casefold()
+            if not all(term in text for term in terms):
+                continue
+            matches.append({
+                "name": tool.virtual_name,
+                "server": tool.server_name,
+                "tool": tool.tool_name,
+                "description": tool.description[:320],
+            })
+        return {
+            "matches": matches[offset : offset + limit],
+            "total": len(matches),
+            "next_offset": offset + limit if offset + limit < len(matches) else None,
+            "discovery": {
+                name: self._discovery_status.get(name, "idle") if self._servers[name]["enabled"] else "disabled"
+                for name in names
+                if name in self._servers
+            },
+            "config_error": None,
+        }
+
+    def call_virtual_tool(self, virtual_name: str, arguments: dict[str, Any]) -> tuple[str, bool]:
+        mapping = self._virtual_tools.get(virtual_name)
+        if mapping is None:
+            return (
+                f"ERROR: unknown MCP virtual tool {virtual_name!r}. Run mcp_refresh and mcp_status.",
+                True,
+            )
+        cfg = self._servers.get(mapping.server_name)
+        if cfg is None or not cfg["enabled"]:
+            return (
+                f"ERROR: MCP server {mapping.server_name!r} is no longer configured or enabled.",
+                True,
+            )
+        self._call_seq += 1
+        payload = {
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        f"Simulated result #{self._call_seq} for "
+                        f"{mapping.server_name}/{mapping.tool_name} "
+                        f"with args={_compact_json(arguments)}"
+                    ),
+                }
+            ],
+            "structuredContent": {
+                "ok": True,
+                "call_seq": self._call_seq,
+                "server": mapping.server_name,
+                "tool": mapping.tool_name,
+            },
+            "isError": False,
+        }
+        return _format_call_result(mapping, payload), False
+
+
+def _session_mcp_globals(sim: Any) -> dict[str, Any] | None:
+    """Return the exact module namespace that built ``sim.session.pipeline``."""
+    sess = getattr(sim, "session", None)
+    pipe = getattr(sess, "pipeline", None)
+    for comp in getattr(pipe, "components", None) or ():
+        if type(comp).__name__ == "MCPToolSchemaPublisher":
+            handle_fn = getattr(type(comp), "handle", None)
+            globs = getattr(handle_fn, "__globals__", None)
+            if isinstance(globs, dict):
+                return globs
+    return None
+
+
+def _register_sim_handlers_impl(sim: Any, rng: Any) -> None:
+    from agent_utils.runtime.simulation import SimOutcome
+
+    world = _SimMCPWorld()
+    # Mirror MCPClientDriver.start() pushing the initial discovered catalog so
+    # enable_mcp_tool and MCPToolSchemaPublisher have a live catalog immediately
+    # (including after crash/restore or shutdown/resume).
+    sim.inject(MCPCatalogUpdated(catalog=world.virtual_tools), delay=0.0)
+
+    def handle_mcp_request(_op_id: Any, req: MCPRequest, _sim: Any) -> SimOutcome:
+        delay = rng.uniform(0.005, 0.03)
+        try:
+            if isinstance(req, MCPStatusRequest):
+                text = world.status_text(enabled=set(req.enabled))
+                return SimOutcome(
+                    value=MCPStatusResult(text=text, catalog=world.virtual_tools),
+                    delay=delay,
+                )
+            if isinstance(req, MCPRefreshRequest):
+                text = world.refresh(server=req.server, enabled=req.enabled)
+                return SimOutcome(
+                    value=MCPRefreshResult(text=text, catalog=world.virtual_tools),
+                    delay=delay,
+                )
+            if isinstance(req, MCPSearchRequest):
+                result = world.search_tools(
+                    query=req.query,
+                    server=req.server,
+                    limit=req.limit,
+                    offset=req.offset,
+                )
+                return SimOutcome(
+                    value=MCPSearchResult(result=result, catalog=world.virtual_tools),
+                    delay=delay,
+                )
+            if isinstance(req, MCPCallToolRequest):
+                text, is_error = world.call_virtual_tool(req.virtual_name, dict(req.arguments))
+                return SimOutcome(
+                    value=MCPCallResult(text=text, is_error=is_error, catalog=world.virtual_tools),
+                    delay=delay,
+                )
+            if isinstance(req, MCPSyncCatalogRequest):
+                return SimOutcome(
+                    value=MCPSyncResult(catalog=world.virtual_tools),
+                    delay=delay,
+                )
+            raise TypeError(f"Unsupported MCPRequest: {type(req).__name__}")
+        except Exception as exc:
+            return SimOutcome(error=exc, delay=delay)
+
+    sim.register_handler(MCPRequest, handle_mcp_request)
+
+
+def register_sim_handlers(sim: Any, rng: Any) -> None:
+    """Register deterministic DST simulation handlers for all ``MCPRequest`` subclasses."""
+    globs = _session_mcp_globals(sim)
+    fn = globs.get("_register_sim_handlers_impl") if globs is not None else None
+    if callable(fn):
+        fn(sim, rng)
+    else:
+        _register_sim_handlers_impl(sim, rng)
+
+
+def _read_enabled_tools(state: State) -> list[Any]:
+    raw_durable = state.features.get(MCP_CLIENT_DURABLE_SPEC.name)
+    if isinstance(raw_durable, dict):
+        val = raw_durable.get("enabled_tools", [])
+    elif raw_durable is not None and hasattr(raw_durable, "enabled_tools"):
+        val = raw_durable.enabled_tools
+    else:
+        val = []
+    return val
+
+
+def _read_runtime_catalog(state: State) -> Any:
+    rt = state.runtime("mcp_client")
+    return getattr(rt, "catalog", None) if rt is not None else None
+
+
+def fuzz_tool_args(tool_name: str, rng: Any, state: State) -> dict[str, Any] | None:
+    """Generate schema-valid arguments for MCP management and virtual tools during DST fuzzing."""
+    if tool_name == "mcp_status":
+        return {}
+    if tool_name == "mcp_refresh":
+        args: dict[str, Any] = {}
+        server = rng.choice([None, None, "filesystem", "git", "docs", "analytics"])
+        if server is not None:
+            args["server"] = server
+        if rng.random() < 0.5:
+            args["wait_seconds"] = rng.choice([0, 0.5, 1.0])
+        return args
+    if tool_name == "search_mcp":
+        args = {
+            "query": rng.choice(["", "file", "git", "docs", "read", "search", "status"]),
+            "limit": rng.choice([5, 10, 20]),
+            "offset": rng.choice([0, 0, 1]),
+        }
+        server = rng.choice([None, None, None, "filesystem", "git", "docs", "analytics"])
+        if server is not None:
+            args["server"] = server
+        return args
+    if tool_name == "enable_mcp_tool":
+        cat = _read_runtime_catalog(state)
+        vtools = cat.virtual_tools if cat is not None and hasattr(cat, "virtual_tools") else {}
+        available = sorted(vtools)
+        if not available:
+            return {"tool": []}
+        enabled_list = _read_enabled_tools(state)
+        enabled_set = {n for n in enabled_list if isinstance(n, str)} if isinstance(enabled_list, list) else set()
+        unenabled = [name for name in available if name not in enabled_set]
+        pool = unenabled if (unenabled and rng.random() < 0.75) else available
+        count = min(len(pool), rng.randint(1, 2))
+        return {"tool": sorted(rng.sample(pool, count))}
+
+    # Support dynamically enabled virtual MCP endpoints as well.
+    cat = _read_runtime_catalog(state)
+    if cat is not None and callable(getattr(cat, "get", None)):
+        vtool = cat.get(tool_name)
+        if vtool is not None:
+            if tool_name == "mcp_filesystem_read_file":
+                return {"path": rng.choice(["/workspace/app.py", "/workspace/notes.txt"])}
+            if tool_name == "mcp_filesystem_list_dir":
+                return {"path": "/workspace"}
+            if tool_name == "mcp_filesystem_search_files":
+                return {"pattern": rng.choice(["*.py", "*.txt"]), "path": "/workspace"}
+            if tool_name == "mcp_git_status":
+                return {}
+            if tool_name == "mcp_git_log":
+                return {"limit": rng.randint(1, 10)}
+            if tool_name == "mcp_docs_search":
+                return {"query": rng.choice(["mcp", "tools", "protocol"]), "limit": rng.randint(1, 5)}
+            if tool_name == "mcp_docs_fetch":
+                return {"slug": rng.choice(["getting-started", "protocol-2026"])}
+            return {}
+    return None
+
+
+def check_invariants(session: Any) -> None:
+    """Verify MCP client gating and durable-state invariants after every DST step."""
+    state = session.state
+    enabled_list = _read_enabled_tools(state)
+
+    assert isinstance(enabled_list, list), (
+        f"MCPClientState.enabled_tools must be a list, got {type(enabled_list).__name__}"
+    )
+    assert all(isinstance(name, str) and name for name in enabled_list), (
+        f"MCPClientState.enabled_tools must contain nonempty strings: {enabled_list!r}"
+    )
+    assert enabled_list == sorted(set(enabled_list)), (
+        f"MCPClientState.enabled_tools must be sorted and unique: {enabled_list!r}"
+    )
+    assert not (set(enabled_list) & _RESERVED_CONTROL_NAMES), (
+        f"MCPClientState.enabled_tools cannot contain reserved control names: {enabled_list!r}"
+    )
+
+    enabled_set = set(enabled_list)
+    tool_schemas = getattr(state, "tool_schemas", None) or {}
+    for name, entry in tool_schemas.items():
+        if not _owns_endpoint(entry):
+            continue
+        assert name in enabled_set, (
+            f"MCP virtual endpoint {name!r} leaked into state.tool_schemas without being enabled"
+        )
+        assert name not in _RESERVED_CONTROL_NAMES, (
+            f"MCP virtual endpoint {name!r} collides with reserved control tool"
+        )
+        assert entry.get("available") is True, (
+            f"Published MCP virtual endpoint {name!r} must have available=True"
+        )
+        fn = entry.get("schema", {}).get("function", {})
+        assert fn.get("name") == name, (
+            f"Published MCP virtual endpoint schema name mismatch: key={name!r}, schema={fn.get('name')!r}"
+        )
